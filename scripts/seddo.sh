@@ -150,8 +150,15 @@ extract_gist_id() {
 }
 
 # Fetch a gist file (raw text)
+# Usage: fetch_file 
 fetch_file() {
-  local gist_id="${1:-$GIST_ID}"
+  local filename="$1"
+  gh gist view "$GIST_ID" -f "$filename" 2>/dev/null || echo ""
+}
+
+# Fetch from a specific gist (not the current one)
+fetch_from() {
+  local gist_id="$1"
   local filename="$2"
   gh gist view "$gist_id" -f "$filename" 2>/dev/null || echo ""
 }
@@ -219,6 +226,17 @@ get_gh_user() {
   gh api user --jq .login 2>/dev/null || echo ""
 }
 
+# Get gist owner login (returns empty if gist doesn't exist or not accessible)
+gist_owner() {
+  local gist_id="$1"
+  gh gist view "$gist_id" --raw 2>/dev/null | head -1 || echo ""
+  # Actually use the API to get owner
+  curl -s -H "Authorization: Bearer $(gh auth token)" \
+       -H "Accept: application/vnd.github+json" \
+       "https://api.github.com/gists/${gist_id}" 2>/dev/null \
+       | grep -oP '"login":\s*"\K[^"]+' | head -1 || echo ""
+}
+
 # ─── Registry helpers ───────────────────────────────────
 # REGISTRY.md lives in the hub gist and lists all spokes/forks
 update_registry_in_hub() {
@@ -227,7 +245,7 @@ update_registry_in_hub() {
   local fork_gist_url="$3"
 
   local registry
-  registry=$(fetch_file "$GIST_ID" "REGISTRY.md")
+  registry=$(fetch_from "$GIST_ID" "REGISTRY.md")
 
   # Check if already registered
   if echo "$registry" | grep -q "| @${agent_name} "; then
@@ -471,21 +489,64 @@ cmd_join() {
 
   echo ""
   echo "🔱 Forking hub gist (this gives you write access)..."
-  local fork_json
+  local fork_json fork_id fork_url fork_error
   fork_json=$(fork_gist "$hub_gist_id")
 
-  local fork_id
   fork_id=$(echo "$fork_json" | grep -oP '"id":\s*"\K[a-f0-9]{32}' | head -1)
-  local fork_url
   fork_url=$(echo "$fork_json" | grep -oP '"html_url":\s*"\Khttps://gist.github.com[^"]+' | head -1)
+  fork_error=$(echo "$fork_json" | grep -oP '"message":\s*"\K[^"]+' | head -1)
+
+  # Handle "cannot fork your own gist" — configure as hub instead
+  if [[ "$fork_error" == *"cannot fork your own gist"* ]]; then
+    echo "⚠️  You own this gist — configuring as HUB mode (not forking)"
+    echo "   (Your gist, your write access — no fork needed)"
+
+    ensure_seddo_root
+
+    # Determine local seddo name
+    local local_name="${swarm_name}"
+    local counter=1
+    while [[ -d "${SEDDO_ROOT}/${local_name}" ]] && [[ "$counter" -lt 100 ]]; do
+      local_name="${swarm_name}-${counter}"
+      ((counter++))
+    done
+
+    local canonical_url="https://gist.github.com/${hub_gist_id}"
+    [[ -n "$GH_USER" ]] && canonical_url="https://gist.github.com/${GH_USER}/${hub_gist_id}"
+
+    save_seddo_config "$local_name" <<EOF
+GIST_ID=${hub_gist_id}
+GIST_URL=${canonical_url}
+AGENT_NAME=${agent_name}
+ROLE=hub
+FORK_OF=
+FORK_GIST_ID=
+EOF
+
+    save_state_json "$local_name" <<EOF
+{
+  "role": "hub",
+  "gist_id": "${hub_gist_id}",
+  "gist_url": "${canonical_url}",
+  "mode": "own-gist",
+  "joined_at": "$(now)",
+  "agent_name": "${agent_name}"
+}
+EOF
+
+    echo ""
+    echo "✅ Joined seddo « ${local_name} » as @${agent_name}"
+    echo "   Role    : HUB (you own this gist)"
+    echo "   Gist    : ${hub_gist_id}"
+    echo ""
+    echo "Next steps:"
+    echo "  seddo sync      — read all files"
+    echo "  seddo inbox     — check messages"
+    return 0
+  fi
 
   if [[ -z "$fork_id" ]]; then
-    echo "❌ Fork failed. Check your GitHub token scope (needs gist)."
-
-    # Try to be more informative
-    local fork_error
-    fork_error=$(echo "$fork_json" | grep -oP '"message":\s*"\K[^"]+' | head -1)
-    [[ -n "$fork_error" ]] && echo "   GitHub said: $fork_error"
+    echo "❌ Fork failed. GitHub said: ${fork_error:-unknown}"
     exit 1
   fi
 
@@ -698,7 +759,7 @@ cmd_sync() {
     if [[ "$mode" == "--pull-hub" ]] || [[ -z "$mode" ]]; then
       echo "🔄 [SPOKE] Pulling from hub gist..."
       local hub_content
-      hub_content=$(fetch_file "$FORK_OF" "ACTIVITY.md")
+      hub_content=$(fetch_from "$FORK_OF" "ACTIVITY.md")
       echo "   Hub activity (last 10):"
       echo "${hub_content}" | tail -10
       echo ""
@@ -725,7 +786,7 @@ cmd_sync() {
     # HUB: collect from forks via REGISTRY.md
     echo "🔄 [HUB] Syncing..."
     local registry
-    registry=$(fetch_file "$GIST_ID" "REGISTRY.md")
+    registry=$(fetch_from "$GIST_ID" "REGISTRY.md")
 
     if [[ -z "$registry" ]] || ! echo "$registry" | grep -q "^|"; then
       echo "   No forks registered in REGISTRY.md."
@@ -760,12 +821,12 @@ cmd_send() {
   local gist_to_write="$GIST_ID"
 
   local current_inbox
-  current_inbox=$(fetch_file "$gist_to_write" "INBOX.md")
+  current_inbox=$(fetch_from "$gist_to_write" "INBOX.md")
   local new_msg="→ ${target} : ${message} — @${AGENT_NAME} ${ts}"
   edit_file "$gist_to_write" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}"
 
   local current_activity
-  current_activity=$(fetch_file "$gist_to_write" "ACTIVITY.md")
+  current_activity=$(fetch_from "$gist_to_write" "ACTIVITY.md")
   edit_file "$gist_to_write" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
 
   echo "✅ Message sent to ${target} (via ${gist_to_write:0:8}...)"
@@ -795,7 +856,7 @@ cmd_add() {
   ts=$(now)
 
   local current_tasks
-  current_tasks=$(fetch_file "$GIST_ID" "TASKS.md")
+  current_tasks=$(fetch_file "TASKS.md")
   local count
   count=$(echo "$current_tasks" | grep -c '^### T-' || true)
   local task_id
@@ -814,7 +875,7 @@ cmd_add() {
   edit_file "$GIST_ID" "TASKS.md" "${current_tasks}${new_task}"
 
   local current_activity
-  current_activity=$(fetch_file "$GIST_ID" "ACTIVITY.md")
+  current_activity=$(fetch_file "ACTIVITY.md")
   edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Task ${task_id} created: ${title}"
 
   echo "✅ Task ${task_id} created: ${title}"
@@ -833,7 +894,7 @@ cmd_claim() {
   local ts
   ts=$(now)
   local current_tasks
-  current_tasks=$(fetch_file "$GIST_ID" "TASKS.md")
+  current_tasks=$(fetch_file "TASKS.md")
 
   local updated
   updated=$(update_task_field "$current_tasks" "$task_id" "status" "ASSIGNED")
@@ -843,7 +904,7 @@ cmd_claim() {
   edit_file "$GIST_ID" "TASKS.md" "$updated"
 
   local current_activity
-  current_activity=$(fetch_file "$GIST_ID" "ACTIVITY.md")
+  current_activity=$(fetch_file "ACTIVITY.md")
   edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Task ${task_id} claimed"
 
   echo "✅ Task ${task_id} claimed by @${AGENT_NAME}"
@@ -863,7 +924,7 @@ cmd_update() {
   local ts
   ts=$(now)
   local current_tasks
-  current_tasks=$(fetch_file "$GIST_ID" "TASKS.md")
+  current_tasks=$(fetch_file "TASKS.md")
 
   local updated
   updated=$(update_task_field "$current_tasks" "$task_id" "status" "$new_status")
@@ -872,7 +933,7 @@ cmd_update() {
   edit_file "$GIST_ID" "TASKS.md" "$updated"
 
   local current_activity
-  current_activity=$(fetch_file "$GIST_ID" "ACTIVITY.md")
+  current_activity=$(fetch_file "ACTIVITY.md")
   edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Task ${task_id} → ${new_status}"
 
   echo "✅ Task ${task_id} → ${new_status}"
@@ -888,7 +949,7 @@ cmd_done() {
   local ts
   ts=$(now)
   local current_tasks
-  current_tasks=$(fetch_file "$GIST_ID" "TASKS.md")
+  current_tasks=$(fetch_file "TASKS.md")
 
   local updated
   updated=$(update_task_field "$current_tasks" "$task_id" "status" "DONE")
@@ -898,7 +959,7 @@ cmd_done() {
   edit_file "$GIST_ID" "TASKS.md" "$updated"
 
   local current_activity
-  current_activity=$(fetch_file "$GIST_ID" "ACTIVITY.md")
+  current_activity=$(fetch_file "ACTIVITY.md")
   edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Task ${task_id} DONE: ${output}"
 
   echo "✅ Task ${task_id} marked DONE"
@@ -918,7 +979,7 @@ cmd_lesson() {
   local ts
   ts=$(now)
   local current
-  current=$(fetch_file "$GIST_ID" "LESSONS.md")
+  current=$(fetch_file "LESSONS.md")
   local count
   count=$(echo "$current" | grep -c '^### L-' || true)
   local lesson_id
