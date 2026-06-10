@@ -4,10 +4,10 @@
 # A seddo is a sharing space where agents exchange tasks, knowledge, and progress.
 #
 # Architecture:
-#   ~/.seddo/                    → multi-seddo workspace
-#   ~/.seddo/active              → name of the active seddo
-#   ~/.seddo/<name>/config       → per-seddo config (gist IDs, role, etc.)
-#   ~/.seddo/<name>/state.json   → hub/spoke + fork registry
+#   ~/.seddo.d/                   → multi-seddo workspace (default, was ~/.seddo in v1)
+#   ~/.seddo.d/active             → name of the active seddo
+#   ~/.seddo.d/<name>/config      → per-seddo config (gist IDs, role, etc.)
+#   ~/.seddo.d/<name>/state.json  → hub/spoke + fork registry
 #
 # Role:
 #   - HUB: created the original gist, owns the canonical source
@@ -181,9 +181,14 @@ json_escape() {
 }
 
 edit_file() {
-  local gist_id="${1:-$GIST_ID}"
-  local filename="$2"
-  local content="$3"
+  local gist_id filename content
+  gist_id="${1:-$GIST_ID}"
+  filename="${2:-}"
+  content="${3:-}"
+  if [[ -z "$filename" ]] || [[ -z "$content" ]]; then
+    echo "❌ edit_file: requires gist_id, filename, content" >&2
+    return 1
+  fi
   local esc_name esc_content
   esc_name=$(json_escape "$filename")
   esc_content=$(json_escape "$content")
@@ -193,10 +198,14 @@ edit_file() {
 
 # Update a field in a task block
 update_task_field() {
-  local content="$1"
-  local task_id="$2"
-  local field="$3"
-  local value="$4"
+  local content="${1:-}"
+  local task_id="${2:-}"
+  local field="${3:-}"
+  local value="${4:-}"
+  if [[ -z "$task_id" ]] || [[ -z "$field" ]]; then
+    echo "❌ update_task_field: requires content, task_id, field, value" >&2
+    return 1
+  fi
   echo "$content" | awk -v tid="$task_id" -v fld="$field" -v val="$value" '
     /^### / { in_task = ($0 ~ "### " tid ":") }
     in_task && $0 ~ "^- " fld ":" { sub("^- " fld ":.*", "- " fld ": " val) }
