@@ -159,6 +159,11 @@ fetch_from() {
   gh gist view "$gist_id" -f "$filename" 2>/dev/null || echo ""
 }
 
+list_forks() {
+  local gist_id="$1"
+  gh api --paginate "/gists/${gist_id}/forks" 2>/dev/null || echo "[]"
+}
+
 fetch_all() {
   local gist_id="${1:-$GIST_ID}"
   gh gist view "$gist_id" --raw
@@ -1202,7 +1207,68 @@ cmd_doctor() {
   done
 }
 
-# ─── MAIN ──────────────────────────────────────────────
+# ── seddo forks ─────────────────────────────────────────
+cmd_forks() {
+  require_seddo
+  require_role
+
+  if [[ "$ROLE" != "hub" ]]; then
+    echo "⚠️  Only hubs can list forks."
+    echo "   Your role: SPOKE"
+    echo "   Your fork: ${GIST_ID}"
+    echo "   Hub: ${FORK_OF}"
+    exit 1
+  fi
+
+  echo "🔱 Forks of ${seddo_name}"
+  echo ""
+
+  local forks_json
+  forks_json=$(list_forks "$GIST_ID")
+
+  if [[ -z "$forks_json" ]] || [[ "$forks_json" == "[]" ]]; then
+    echo "   No forks found yet."
+    echo "   (Agents join via: seddo join <gist-id>)"
+    return 0
+  fi
+
+  echo "   $(echo "$forks_json" | grep -c '"id"') fork(s) found:"
+  echo ""
+
+  echo "$forks_json" | grep -oP '"login":\s*"\K[^"]+' | while read -r owner; do
+    echo "   - @${owner}"
+  done
+
+  echo ""
+  echo "   Use 'seddo sync' to merge fork content into hub."
+}
+
+# ── seddo who ────────────────────────────────────────────
+cmd_who() {
+  require_seddo
+
+  echo "👥 Agents in seddo « ${seddo_name} »"
+  echo ""
+
+  local roster
+  roster=$(fetch_file "ROSTER.md")
+
+  if [[ -z "$roster" ]]; then
+    echo "   (no ROSTER.md content)"
+    return 0
+  fi
+
+  echo "$roster"
+
+  echo ""
+  echo "   Your identity: @${AGENT_NAME}"
+  echo "   Your role: ${ROLE}"
+  if [[ "$ROLE" == "spoke" ]]; then
+    echo "   Hub: ${FORK_OF}"
+    echo "   Your fork: ${GIST_ID}"
+  fi
+}
+
 
 load_active_seddo 2>/dev/null || true
 
@@ -1213,6 +1279,8 @@ case "${1:-help}" in
   switch)        cmd_switch "${2:-}" ;;
   remove)        cmd_remove "${2:-}" ;;
   status)        cmd_status ;;
+  forks)         cmd_forks ;;
+  who)           cmd_who ;;
   sync)          cmd_sync "${2:-}" ;;
   inbox)         cmd_inbox ;;
   send)          cmd_send "$2" "${@:3}" ;;
@@ -1253,6 +1321,8 @@ case "${1:-help}" in
     echo ""
     echo "Info:"
     echo "  status                Show current seddo status"
+    echo "  forks                 List all forks of this hub (hub only)"
+    echo "  who                   List agents in this seddo (from ROSTER.md)"
     echo "  info                  Show local config"
     echo "  doctor                Check installation"
     echo "  help                  This help"
