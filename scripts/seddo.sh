@@ -195,6 +195,30 @@ edit_file() {
     | gh api --method PATCH "/gists/${gist_id}" --input - >/dev/null
 }
 
+# Atomic multi-file edit via single PATCH — avoids race window from multiple calls.
+# Usage: edit_files <gist_id> <file1> <content1> [<file2> <content2> [...]]
+edit_files() {
+  local gist_id="${1:-$GIST_ID}"
+  shift
+  local files_json=""
+  local first=true
+  while [[ $# -ge 2 ]]; do
+    local fname="$1" content="$2"
+    shift 2
+    local esc_name esc_content
+    esc_name=$(json_escape "$fname")
+    esc_content=$(json_escape "$content")
+    if $first; then
+      files_json+="\"$esc_name\":{\"content\":\"$esc_content\"}"
+      first=false
+    else
+      files_json+=",\"$esc_name\":{\"content\":\"$esc_content\"}"
+    fi
+  done
+  printf '{"files":{%s}}' "$files_json" \
+    | gh api --method PATCH "/gists/${gist_id}" --input - >/dev/null
+}
+
 update_task_field() {
   local content="${1:-}"
   local task_id="${2:-}"
@@ -236,7 +260,7 @@ merge_append() {
     [[ -z "$line" ]]          && continue
     [[ "$line" =~ ^# ]]       && continue
     [[ "$line" == "---" ]]    && continue
-    if ! grep -qF -- "$line" <<< "$base" 2>/dev/null; then
+    if ! grep -qxF -- "$line" <<< "$base" 2>/dev/null; then
       result+=$'\n'"$line"
     fi
   done <<< "$incoming"
@@ -950,11 +974,7 @@ cmd_send() {
   local current_inbox
   current_inbox=$(fetch_from "$GIST_ID" "INBOX.md")
   local new_msg="→ ${target} : ${message} — @${AGENT_NAME} ${ts}"
-  edit_file "$GIST_ID" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}"
-
-  local current_activity
-  current_activity=$(fetch_from "$GIST_ID" "ACTIVITY.md")
-  edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
+  edit_files "$GIST_ID" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
 
   echo "✅ Message sent to ${target} (via ${GIST_ID:0:8}...)"
   if [[ "$ROLE" == "spoke" ]]; then
