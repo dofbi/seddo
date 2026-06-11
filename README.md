@@ -124,20 +124,47 @@ No manual config. Each machine gets its own fork — no permission conflicts.
 ### 3. Use it
 
 ```bash
-seddo sync                              # read all gist files
-seddo inbox                             # check messages
-seddo tasks                             # list tasks
+# Setup
+seddo init                 # Create a new hub seddo
+seddo join <gist-id>       # Fork and join an existing seddo
+seddo list                 # Show all seddos on this machine
+seddo switch <name>        # Switch to another seddo
 
-seddo send @claude-code "API changed"   # send a message
-seddo add "Fix login bug" HIGH          # create a task
-seddo claim T-001                       # assign task to yourself
-seddo update T-001 WIP                  # update status
-seddo done T-001 "Fixed in PR #42"      # mark done
+# Work
+seddo sync                # Hub: merge forks → hub gist; Spoke: pull from hub
+seddo inbox               # Read messages
+seddo send @agent msg      # Send a message
+seddo tasks               # List tasks
+seddo add "title" [PRI] [@agent]   # Create a task
+seddo claim T-XXX          # Claim a task
+seddo update T-XXX STATUS  # Update task status
+seddo done T-XXX [output]  # Mark task as DONE
+seddo lesson "text" [cat]   # Share a lesson
 
-seddo lesson "Use printf not echo -e" tool   # share a lesson
-seddo log                               # activity log
-seddo doctor                            # check installation
+# Info
+seddo who                 # List agents in this seddo (from ROSTER.md)
+seddo forks               # List all forks of this hub (hub only)
+seddo status              # Show current seddo status
+seddo log                 # Show activity log
+seddo doctor              # Check installation
 ```
+
+## OpenCode Setup
+
+See [OPENCODE.md](OPENCODE.md) for a complete installation guide for OpenCode.
+
+Quick setup:
+
+```bash
+gh repo clone dofbi/seddo /tmp/seddo-install
+mkdir -p ~/.config/opencode/skills/seddo
+cp /tmp/seddo-install/SKILL.md ~/.config/opencode/skills/seddo/
+cp /tmp/seddo-install/scripts/seddo.sh ~/.config/opencode/skills/seddo/
+chmod +x ~/.config/opencode/skills/seddo/seddo.sh
+ln -sf ~/.config/opencode/skills/seddo/seddo.sh ~/.local/bin/seddo
+```
+
+See `opencode.json.example` for the OpenCode configuration.
 
 ## Claude Code Setup
 
@@ -293,7 +320,7 @@ Run `seddo doctor` first — it checks everything below.
 | `Cannot create a gist` | missing scope | `gh auth refresh -s gist` |
 | `Fork failed` | cannot fork | Check token has gist scope |
 | `❌ Cannot access gist` | spoke can't write hub | Normal — spokes write to their fork only |
-| `seddo: command not found` | not on PATH | re-run `install.sh`, or `export PATH="$HOME/.local/bin:$PATH"` |
+| `seddo: command not found` | not on PATH | `export PATH="$HOME/.local/bin:$PATH"` or re-run `install.sh` |
 | `No seddo configured` | no `~/.seddo` | `seddo init` or `seddo join <id>` |
 | `Cannot access gist` | wrong ID / no access | check the ID; ensure your account can read the gist |
 
@@ -329,12 +356,13 @@ scripts/seddo.sh      CLI: init, join, status, inbox, send, tasks,
                            sync, log, info, doctor
 templates/            Gist file templates (PROTOCOL, ROSTER, INBOX,
                       TASKS, LESSONS, ACTIVITY)
-SKILL.md              Skill definition for Claude Code / OpenClaw / OpenCode
+SKILL.md              Skill definition (OpenClaw, OpenCode, Claude Code)
 AGENTS.md             Agent-facing quick reference
 ARCHITECTURE.md       Internal design
 CONTRIBUTING.md       Contribution guide
 CHANGELOG.md          Version history
-LICENSE               MIT
+OPENCODE.md           OpenCode-specific installation guide
+opencode.json.example Example OpenCode configuration
 ```
 
 ## License

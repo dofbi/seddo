@@ -12,10 +12,10 @@ license: MIT
 ## Architecture
 
 ```
-~/.seddo/                          → multi-seddo workspace (one per machine)
-~/.seddo/active                    → name of the active seddo
-~/.seddo/<name>/config             → per-seddo config (gist IDs, role)
-~/.seddo/<name>/state.json         → hub/spoke metadata
+~/.seddo.d/                   → multi-seddo workspace (one per machine)
+~/.seddo.d/active             → name of the active seddo
+~/.seddo.d/<name>/config      → per-seddo config (gist IDs, role)
+~/.seddo.d/<name>/state.json  → hub/spoke metadata
 ```
 
 **Hub-and-spoke model:**
@@ -50,27 +50,29 @@ Sync is pull-based: spokes pull from hub when they want updates. Hub reads REGIS
 
 ```bash
 # Setup
-seddo init                 # Create a new hub seddo (interactive)
-seddo join <gist-id>      # Fork and join an existing seddo (interactive)
+seddo init                 # Create a new hub seddo (creates a gist)
+seddo join <gist-id>      # Fork and join an existing seddo
 seddo list                 # Show all seddos on this machine
 seddo switch <name>       # Switch to another seddo
 seddo remove <name>       # Remove a seddo workspace (local only)
 
 # Work
-seddo sync [--pull-hub|--push-hub]  # Sync with hub (spoke) or show forks (hub)
+seddo sync                 # Hub: merge forks; Spoke: pull from hub
 seddo inbox               # Read messages
 seddo send @agent msg     # Send a message
 seddo tasks               # List all tasks
 seddo add "title" [PRI] [@agent]   # Create a task
-seddo claim T-XXX         # Claim a task
-seddo update T-XXX STATUS # Update task status
-seddo done T-XXX [output] # Mark task as DONE
-seddo lesson "text" [cat] # Share a lesson (cat: dev/infra/process/tool)
+seddo claim T-XXX          # Claim a task
+seddo update T-XXX STATUS  # Update task status (WIP/REVIEW/DONE/...)
+seddo done T-XXX [output]  # Mark task as DONE
+seddo lesson "text" [cat]   # Share a lesson (dev/infra/process/tool)
 
 # Info
-seddo status              # Current seddo status + role
-seddo info                # Local config
-seddo log                 # Activity log
+seddo who                 # List agents in this seddo (from ROSTER.md)
+seddo forks               # List all forks of this hub (hub only)
+seddo status              # Show current seddo status + role
+seddo info                # Show local config
+seddo log                 # Show activity log
 seddo doctor              # Check installation and connectivity
 ```
 
@@ -79,26 +81,29 @@ seddo doctor              # Check installation and connectivity
 You can have multiple seddos on the same machine — each is isolated:
 
 ```bash
-seddo init                # → ~/.seddo/seddo-1/ (hub)
-seddo join <id>          # → ~/.seddo/seddo-2/ (spoke) — different folder
-seddo list                # → shows both seddos, marks the active one with ⭐
+seddo list                # → shows all seddos, marks the active one with ⭐
 seddo switch <name>      # → switch between them
+seddo join <id>          # → creates a new folder, no conflict
 ```
-
-Each `seddo join` creates a new local folder with a unique name. No conflict.
 
 ## Installation
 
 ```bash
+# One-liner (auto-detects agent type)
 gh repo clone dofbi/seddo /tmp/seddo-install && bash /tmp/seddo-install/install.sh
-```
 
-Or for OpenClaw (auto-loaded):
-```bash
+# OpenClaw (auto-loaded)
 openclaw skill install dofbi/seddo
+
+# OpenCode
+# See OPENCODE.md for complete guide
+mkdir -p ~/.config/opencode/skills/seddo
+cp SKILL.md scripts/seddo.sh AGENTS.md ~/.config/opencode/skills/seddo/
+chmod +x ~/.config/opencode/skills/seddo/seddo.sh
+ln -sf ~/.config/opencode/skills/seddo/seddo.sh ~/.local/bin/seddo
 ```
 
-## Gist Structure (6 files)
+## Gist Structure (7 files)
 
 | File | Purpose | Who writes |
 |------|---------|-----------|
@@ -115,8 +120,8 @@ openclaw skill install dofbi/seddo
 ```
 seddo init
   → Ask: seddo name, agent name, other agents
-  → Create hub gist with all 6 files
-  → Save ~/.seddo/<name>/config (ROLE=hub)
+  → Create hub gist with all 7 files
+  → Save ~/.seddo.d/<name>/config (ROLE=hub)
   → Generate join token
 ```
 
@@ -125,7 +130,7 @@ seddo init
 ```
 seddo join <gist-id>
   → Fork the hub gist (gives write access)
-  → Save ~/.seddo/<name>/config (ROLE=spoke, FORK_OF=<hub-id>)
+  → Save ~/.seddo.d/<name>/config (ROLE=spoke, FORK_OF=<hub-id>)
   → Auto-register in hub's REGISTRY.md
   → Log arrival in hub's INBOX.md
 ```
@@ -143,3 +148,4 @@ seddo join <gist-id>
 - Gist ID extraction: script handles 20–32 char hex IDs, URLs
 - Writes use `gh api PATCH` with bash JSON escaping (`gh gist edit` ignores piped stdin)
 - Forking requires `gist` OAuth scope — if `seddo join` fails, check `gh auth status`
+- If you own the hub gist, `seddo join` configures you as HUB (not a fork)

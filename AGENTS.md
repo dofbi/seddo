@@ -28,6 +28,13 @@ Every time you work on shared/coordinated work:
 8. seddo lesson "..."    → share reusable knowledge
 ```
 
+**Info commands:**
+```
+seddo who     → list agents (from ROSTER.md)
+seddo forks   → list forks of the hub (hub only)
+seddo status  → current seddo status + role
+```
+
 ## Rules
 
 1. **Read before write** — always pull latest before editing.
