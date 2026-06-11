@@ -4,20 +4,20 @@
 # A seddo is a sharing space where agents exchange tasks, knowledge, and progress.
 #
 # Architecture:
-#   ~/.seddo.d/                   → multi-seddo workspace (default, was ~/.seddo in v1)
+#   ~/.seddo.d/                   → multi-seddo workspace
 #   ~/.seddo.d/active             → name of the active seddo
 #   ~/.seddo.d/<name>/config      → per-seddo config (gist IDs, role, etc.)
-#   ~/.seddo.d/<name>/state.json  → hub/spoke + fork registry
+#   ~/.seddo.d/<name>/state.json  → hub/spoke metadata
 #
 # Role:
 #   - HUB: created the original gist, owns the canonical source
-#   - SPOKE: forked the gist, syncs via hub → spoke pull, spoke → hub push
+#   - SPOKE: forked the gist, syncs via hub pull-based merge
 
 set -euo pipefail
 
 SEDDO_ROOT="${SEDDO_ROOT:-$HOME/.seddo.d}"
 SEDDO_ACTIVE_FILE="${SEDDO_ROOT}/active"
-SEDDO_VERSION="2.0.0"
+SEDDO_VERSION="2.1.0"
 
 # Per-seddo paths (set by load_config)
 seddo_name=""
@@ -96,7 +96,6 @@ save_seddo_config() {
   seddo_config="${SEDDO_ROOT}/${name}/config"
   mkdir -p "$(dirname "$seddo_config")"
   cat > "$seddo_config"
-  # Set as active
   echo "$name" > "$SEDDO_ACTIVE_FILE"
   seddo_name="$name"
 }
@@ -138,7 +137,7 @@ require_role() {
   fi
 }
 
-# ─── Gist helpers ───────────────────────────────────────
+# ─── Gist helpers ────────────────────────────────────────
 extract_gist_id() {
   local url="$1"
   local id
@@ -149,27 +148,22 @@ extract_gist_id() {
   return 1
 }
 
-# Fetch a gist file (raw text)
-# Usage: fetch_file 
 fetch_file() {
   local filename="$1"
   gh gist view "$GIST_ID" -f "$filename" 2>/dev/null || echo ""
 }
 
-# Fetch from a specific gist (not the current one)
 fetch_from() {
   local gist_id="$1"
   local filename="$2"
   gh gist view "$gist_id" -f "$filename" 2>/dev/null || echo ""
 }
 
-# Fetch all gist files (raw)
 fetch_all() {
   local gist_id="${1:-$GIST_ID}"
   gh gist view "$gist_id" --raw
 }
 
-# Edit a gist file via PATCH (pure bash + gh)
 json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
@@ -196,7 +190,6 @@ edit_file() {
     | gh api --method PATCH "/gists/${gist_id}" --input - >/dev/null
 }
 
-# Update a field in a task block
 update_task_field() {
   local content="${1:-}"
   local task_id="${2:-}"
@@ -213,70 +206,110 @@ update_task_field() {
   '
 }
 
-# Fork a gist (POST /gists/:id/forks) — returns fork gist JSON
 fork_gist() {
   local gist_id="$1"
-  local fork_info
-  fork_info=$(curl -s -X POST \
+  curl -s -X POST \
     -H "Authorization: Bearer $(gh auth token)" \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/gists/${gist_id}/forks")
-  echo "$fork_info"
+    "https://api.github.com/gists/${gist_id}/forks"
 }
 
-# Get list of forks for a gist
-list_forks() {
-  local gist_id="$1"
-  gh api --paginate "/gists/${gist_id}/forks" 2>/dev/null || echo "[]"
-}
-
-# Get current GitHub user
 get_gh_user() {
   gh api user --jq .login 2>/dev/null || echo ""
 }
 
-# Get gist owner login (returns empty if gist doesn't exist or not accessible)
-gist_owner() {
-  local gist_id="$1"
-  gh gist view "$gist_id" --raw 2>/dev/null | head -1 || echo ""
-  # Actually use the API to get owner
-  curl -s -H "Authorization: Bearer $(gh auth token)" \
-       -H "Accept: application/vnd.github+json" \
-       "https://api.github.com/gists/${gist_id}" 2>/dev/null \
-       | grep -oP '"login":\s*"\K[^"]+' | head -1 || echo ""
+# ─── Merge helpers ───────────────────────────────────────
+
+# Merge append-only files (INBOX, ACTIVITY, LESSONS).
+# Takes base as canonical; appends lines from incoming not already in base.
+# Skips headers, blank lines, and separators from dedup check.
+merge_append() {
+  local base="$1"
+  local incoming="$2"
+  local result="$base"
+  while IFS= read -r line; do
+    [[ -z "$line" ]]          && continue
+    [[ "$line" =~ ^# ]]       && continue
+    [[ "$line" == "---" ]]    && continue
+    if ! grep -qF -- "$line" <<< "$base" 2>/dev/null; then
+      result+=$'\n'"$line"
+    fi
+  done <<< "$incoming"
+  printf '%s' "$result"
 }
 
-# ─── Registry helpers ───────────────────────────────────
-# REGISTRY.md lives in the hub gist and lists all spokes/forks
-update_registry_in_hub() {
-  local agent_name="$1"
-  local fork_gist_id="$2"
-  local fork_gist_url="$3"
+# Merge TASKS.md: block-based, last-write-wins by updated: timestamp.
+# Tasks only in incoming are appended. Preserves base preamble.
+merge_tasks() {
+  local base="$1"
+  local incoming="$2"
 
-  local registry
-  registry=$(fetch_from "$GIST_ID" "REGISTRY.md")
+  local preamble
+  preamble=$(awk '/^### T-/{exit} {print}' <<< "$base")
 
-  # Check if already registered
-  if echo "$registry" | grep -q "| @${agent_name} "; then
-    # Update existing row
-    echo "   (already registered in REGISTRY.md)"
-    return
-  fi
+  declare -A base_blocks base_ts inc_blocks inc_ts
 
-  local ts
-  ts=$(now)
-  local row="| @${agent_name} | ${fork_gist_id} | ${fork_gist_url} | ${ts} |"
-  local nl=$'\n'
+  local cur_id="" cur_block=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^###\ T-([0-9]+): ]]; then
+      [[ -n "$cur_id" ]] && base_blocks["$cur_id"]="$cur_block"
+      cur_id="T-${BASH_REMATCH[1]}"
+      cur_block="$line"$'\n'
+    elif [[ -n "$cur_id" ]]; then
+      cur_block+="$line"$'\n'
+      if [[ "$line" =~ ^-\ updated:\ (.+) ]]; then
+        base_ts["$cur_id"]="${BASH_REMATCH[1]}"
+      fi
+    fi
+  done <<< "$base"
+  [[ -n "$cur_id" ]] && base_blocks["$cur_id"]="$cur_block"
 
-  if [[ -z "$registry" ]] || ! echo "$registry" | grep -q "^| Agent"; then
-    # Create header
-    registry="# Registry — ${seddo_name}${nl}${nl}| Agent | Fork Gist ID | Fork URL | Registered |${nl}|-------|-------------|----------|-------------|"
-  fi
+  cur_id="" cur_block=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^###\ T-([0-9]+): ]]; then
+      [[ -n "$cur_id" ]] && inc_blocks["$cur_id"]="$cur_block"
+      cur_id="T-${BASH_REMATCH[1]}"
+      cur_block="$line"$'\n'
+    elif [[ -n "$cur_id" ]]; then
+      cur_block+="$line"$'\n'
+      if [[ "$line" =~ ^-\ updated:\ (.+) ]]; then
+        inc_ts["$cur_id"]="${BASH_REMATCH[1]}"
+      fi
+    fi
+  done <<< "$incoming"
+  [[ -n "$cur_id" ]] && inc_blocks["$cur_id"]="$cur_block"
 
-  edit_file "$GIST_ID" "REGISTRY.md" "${registry}${nl}${row}"
+  declare -A all_ids
+  for id in "${!base_blocks[@]}"; do all_ids["$id"]=1; done
+  for id in "${!inc_blocks[@]}";  do all_ids["$id"]=1; done
+
+  local sorted_ids
+  mapfile -t sorted_ids < <(printf '%s\n' "${!all_ids[@]}" | sort -t- -k2 -n)
+
+  local result="$preamble"
+  for id in "${sorted_ids[@]}"; do
+    local have_base=false have_inc=false
+    [[ -n "${base_blocks[$id]+x}" ]] && have_base=true
+    [[ -n "${inc_blocks[$id]+x}" ]]  && have_inc=true
+
+    if $have_base && $have_inc; then
+      local bt="${base_ts[$id]:-}" it="${inc_ts[$id]:-}"
+      if [[ -n "$it" ]] && [[ "$it" > "$bt" ]]; then
+        result+=$'\n'"${inc_blocks[$id]}"
+      else
+        result+=$'\n'"${base_blocks[$id]}"
+      fi
+    elif $have_base; then
+      result+=$'\n'"${base_blocks[$id]}"
+    else
+      result+=$'\n'"${inc_blocks[$id]}"
+    fi
+  done
+
+  printf '%s' "$result"
 }
 
-# ─── COMMANDS ───────────────────────────────────────────
+# ─── COMMANDS ────────────────────────────────────────────
 
 # ── seddo init ──────────────────────────────────────────
 cmd_init() {
@@ -290,7 +323,6 @@ cmd_init() {
   echo "✅ Authenticated as: @${GH_USER}"
   echo ""
 
-  # Check gist creation permission
   echo "🔍 Testing GitHub permissions..."
   local test_tmp
   test_tmp=$(mktemp)
@@ -309,7 +341,6 @@ cmd_init() {
   echo "✅ Secret gist creatable"
   echo ""
 
-  # Interactive setup
   echo "📂 Seddo name? (no spaces, used as folder name)"
   read -rp "   → " name_input
   name_input="${name_input:-seddo}"
@@ -348,32 +379,90 @@ cmd_init() {
   echo ""
   echo "🤖 Creating hub gist..."
 
-  local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local templates_dir="${script_dir}/../templates"
-
-  # Build gist files
-  local protocol inbox tasks lessons activity registry
-  protocol=$(sed "s/{{SWARM_NAME}}/${name_input}/g" "${templates_dir}/PROTOCOL.md")
-  inbox=$(sed "s/{{SWARM_NAME}}/${name_input}/g" "${templates_dir}/INBOX.md")
-  tasks=$(sed "s/{{SWARM_NAME}}/${name_input}/g" "${templates_dir}/TASKS.md")
-  lessons=$(sed "s/{{SWARM_NAME}}/${name_input}/g" "${templates_dir}/LESSONS.md")
-
-  local ts
+  local ts nl
   ts=$(now)
-  activity="# Activity — ${name_input}${nl}${nl}${ts} @${agent_name} — Seddo « ${name_input} » created (hub) 🤝${nl}"
-  registry="# Registry — ${name_input}${nl}${nl}| Agent | Fork Gist ID | Fork URL | Registered |${nl}|-------|-------------|----------|-------------|${nl}| @${agent_name} | (hub) | (hub) | ${ts} |"
+  nl=$'\n'
 
-  # Create gist with all files
+  # Build gist files — templates inlined, no external files needed
   local tmpdir
   tmpdir=$(mktemp -d)
-  printf '%s\n' "$protocol" > "$tmpdir/PROTOCOL.md"
-  printf '%s\n' "# Roster — ${name_input}${nl}${nl}| Agent | Capacités | Localisation |${nl}|-------|-------------|-------------|" > "$tmpdir/ROSTER.md"
-  printf '%s\n' "$inbox" > "$tmpdir/INBOX.md"
-  printf '%s\n' "$tasks" > "$tmpdir/TASKS.md"
-  printf '%s\n' "$lessons" > "$tmpdir/LESSONS.md"
-  printf '%s\n' "$activity" > "$tmpdir/ACTIVITY.md"
-  printf '%s\n' "$registry" > "$tmpdir/REGISTRY.md"
+
+  cat > "$tmpdir/PROTOCOL.md" << EOF
+# ${name_input} — Seddo Protocol
+
+Rules all agents must follow. Read first.
+
+## Agent Behavior Rules
+
+1. **Read before write** — \`gh gist view\` before editing
+2. **Append, don't overwrite** — add at end, don't remove others' content
+3. **Sign everything** — every entry includes \`— @name timestamp\`
+4. **Update status promptly** — when starting/finishing a task
+5. **Acknowledge messages** — mark read (✅) after acting
+6. **Share lessons** — add to LESSONS.md when you learn something
+7. **Log activity** — ACTIVITY.md for significant actions
+
+## Message Format (INBOX.md)
+\`\`\`
+→ @agent-name : message — @from-agent YYYY-MM-DDTHH:MMZ
+→ @all : broadcast — @from-agent YYYY-MM-DDTHH:MMZ
+\`\`\`
+Status: ✅ read · ⏳ in-progress · ✓ resolved
+
+## Task Format (TASKS.md)
+\`\`\`
+### T-XXX: Task title
+- status: DRAFT | ASSIGNED | WIP | REVIEW | DONE | BLOCKED | NEEDS_HUMAN
+- assigned: @agent or @any
+- priority: LOW | MEDIUM | HIGH | URGENT
+- input: what needs to be done
+- output: (filled when done)
+- created: YYYY-MM-DDTHH:MMZ by @agent
+- updated: YYYY-MM-DDTHH:MMZ
+\`\`\`
+
+## Conflict Resolution
+Gists use last-write-wins per file.
+- Always pull latest before editing
+- Don't edit same file within same minute as another agent
+- If contention: add \`LOCK:\` at top of file while editing, remove after
+EOF
+
+  cat > "$tmpdir/ROSTER.md" << EOF
+# Roster — ${name_input}
+
+| Agent | Capacités | Localisation |
+|-------|-------------|-------------|
+EOF
+
+  cat > "$tmpdir/INBOX.md" << EOF
+# ${name_input} — Inbox
+
+Messages between agents. Append only. Sign every entry.
+
+---
+EOF
+
+  cat > "$tmpdir/TASKS.md" << EOF
+# ${name_input} — Task Board
+
+Append only. Do not edit others' tasks without permission.
+
+---
+EOF
+
+  cat > "$tmpdir/LESSONS.md" << EOF
+# ${name_input} — Lessons Learned
+
+Shared knowledge. Append only. Sign every entry.
+
+---
+EOF
+
+  printf '%s\n' "# Activity — ${name_input}${nl}${nl}${ts} @${agent_name} — Seddo « ${name_input} » created (hub) 🤝" \
+    > "$tmpdir/ACTIVITY.md"
+  printf '%s\n' "# Registry — ${name_input}${nl}${nl}| Agent | Fork Gist ID | Fork URL | Registered |${nl}|-------|-------------|----------|-------------|${nl}| @${agent_name} | (hub) | (hub) | ${ts} |" \
+    > "$tmpdir/REGISTRY.md"
 
   local gist_url
   gist_url=$(gh gist create \
@@ -399,7 +488,6 @@ cmd_init() {
   local canonical_url="https://gist.github.com/${gist_id}"
   [[ -n "$GH_USER" ]] && canonical_url="https://gist.github.com/${GH_USER}/${gist_id}"
 
-  # Save config
   ensure_seddo_root
   save_seddo_config "$name_input" <<EOF
 GIST_ID=${gist_id}
@@ -464,20 +552,17 @@ cmd_join() {
 
   echo "🔍 Connecting to hub gist ${hub_gist_id:0:8}..."
 
-  # Verify we can read the hub
   local raw
   raw=$(gh gist view "$hub_gist_id" --raw 2>/dev/null) || {
     echo "❌ Cannot access gist: ${hub_gist_id}"
     exit 1
   }
 
-  # Detect seddo name from gist content
   local swarm_name
   swarm_name=$(echo "$raw" | grep -m1 '^# Roster\|^# Protocol\|^# Tasks\|^# .*—' \
     | head -1 | sed 's/^# //' | sed 's/ —.*//' | xargs)
   [[ -z "$swarm_name" ]] && swarm_name="seddo"
 
-  # Detect agent name
   local detected=""
   if [[ -n "$AGENT_NAME" ]]; then
     detected="$AGENT_NAME"
@@ -501,18 +586,16 @@ cmd_join() {
   local fork_json fork_id fork_url fork_error
   fork_json=$(fork_gist "$hub_gist_id")
 
-  fork_id=$(echo "$fork_json" | grep -oP '"id":\s*"\K[a-f0-9]{32}' | head -1)
-  fork_url=$(echo "$fork_json" | grep -oP '"html_url":\s*"\Khttps://gist.github.com[^"]+' | head -1)
-  fork_error=$(echo "$fork_json" | grep -oP '"message":\s*"\K[^"]+' | head -1)
+  fork_id=$(echo "$fork_json" | grep -oP '"id":\s*"\K[a-f0-9]{32}' | head -1 || true)
+  fork_url=$(echo "$fork_json" | grep -oP '"html_url":\s*"\Khttps://gist.github.com[^"]+' | head -1 || true)
+  fork_error=$(echo "$fork_json" | grep -oP '"message":\s*"\K[^"]+' | head -1 || true)
 
-  # Handle "cannot fork your own gist" — configure as hub instead
+  # If user owns the hub gist, configure as hub mode instead
   if [[ "$fork_error" == *"cannot fork your own gist"* ]]; then
-    echo "⚠️  You own this gist — configuring as HUB mode (not forking)"
-    echo "   (Your gist, your write access — no fork needed)"
+    echo "⚠️  You own this gist — configuring as HUB mode (no fork needed)"
 
     ensure_seddo_root
 
-    # Determine local seddo name
     local local_name="${swarm_name}"
     local counter=1
     while [[ -d "${SEDDO_ROOT}/${local_name}" ]] && [[ "$counter" -lt 100 ]]; do
@@ -556,15 +639,14 @@ EOF
 
   if [[ -z "$fork_id" ]]; then
     echo "❌ Fork failed. GitHub said: ${fork_error:-unknown}"
+    echo "   Tip: check gist scope → gh auth status"
     exit 1
   fi
 
   echo "✅ Fork created: ${fork_id:0:8}..."
 
-  # Save config BEFORE writing to fork (spoke mode)
   ensure_seddo_root
 
-  # Determine local seddo name (unique per machine)
   local local_name="${swarm_name}"
   local counter=1
   while [[ -d "${SEDDO_ROOT}/${local_name}" ]] && [[ "$counter" -lt 100 ]]; do
@@ -597,21 +679,15 @@ EOF
 
   echo ""
   echo "✅ Joined seddo « ${local_name} » as @${agent_name}"
-  echo "   Role    : SPOKE (fork of hub)"
-  echo "   Hub     : ${hub_gist_id}"
+  echo "   Role     : SPOKE (fork of hub)"
+  echo "   Hub      : ${hub_gist_id}"
   echo "   Your fork: ${fork_id}"
-  echo ""
-  echo "   Local name: ${local_name}"
-  echo "   (Each machine uses its own fork — no conflict!)"
+  echo "   Local    : ${local_name}"
   echo ""
   echo "Next steps:"
-  echo "  seddo sync      — pull from your fork"
+  echo "  seddo sync      — pull hub → your fork (merges all content)"
   echo "  seddo inbox     — check messages"
   echo "  seddo tasks     — check tasks"
-  echo ""
-  echo "📤 To receive updates from hub:"
-  echo "   seddo sync --pull-hub   (pull latest from hub gist)"
-  echo "   seddo sync --push-hub   (push your fork changes to hub)"
 }
 
 # ── seddo list ──────────────────────────────────────────
@@ -731,83 +807,123 @@ cmd_status() {
   echo ""
 
   if [[ "$ROLE" == "spoke" ]]; then
-    echo "   Hub gist: ${FORK_OF}"
+    echo "   Hub gist : ${FORK_OF}"
     echo "   Your fork: ${GIST_ID}"
     echo ""
-    echo "   Sync commands:"
-    echo "   - seddo sync --pull-hub   → pull from hub into your fork"
-    echo "   - seddo sync --push-hub   → push your fork to hub"
-    echo "   - seddo sync              → sync your fork (default)"
+    echo "   Sync: seddo sync"
+    echo "     → pulls hub + merges into your fork (bi-directional)"
   else
-    echo "   Hub gist: ${GIST_ID} (you own it)"
+    echo "   Hub gist : ${GIST_ID} (you own it)"
+    local fork_count
+    fork_count=$(gh api --paginate "/gists/${GIST_ID}/forks" 2>/dev/null \
+      | grep -c '"id":' || echo "0")
+    echo "   Forks    : ${fork_count}"
     echo ""
-    echo "   Sync commands:"
-    echo "   - seddo sync              → pull from all registered forks"
-    echo "   - seddo sync --registry  → show registered forks"
+    echo "   Sync: seddo sync"
+    echo "     → discovers all forks, merges their content into hub"
   fi
 
   echo ""
-  echo "📋 Quick view (last 30 lines of ACTIVITY.md):"
+  echo "📋 Recent activity (last 10 lines):"
   echo ""
-  local activity
-  activity=$(fetch_file "ACTIVITY.md")
-  echo "${activity}" | tail -30
+  fetch_file "ACTIVITY.md" | tail -10
 }
 
 # ── seddo sync ──────────────────────────────────────────
+# Hub:  discover all forks via GitHub API → merge INBOX/ACTIVITY/LESSONS/TASKS
+#       into hub gist (hub is owner, so write works)
+# Spoke: pull hub files → merge with own fork → write to fork
 cmd_sync() {
   require_seddo
   require_role
+  local mode="${1:-}"
 
-  local mode="${2:-}"
-  local ts
-  ts=$(now)
+  if [[ "$ROLE" == "hub" ]]; then
+    echo "🔄 [HUB] Discovering forks..."
 
-  if [[ "$ROLE" == "spoke" ]]; then
-    # SPOKE: sync with hub
-    if [[ "$mode" == "--pull-hub" ]] || [[ -z "$mode" ]]; then
-      echo "🔄 [SPOKE] Pulling from hub gist..."
-      local hub_content
-      hub_content=$(fetch_from "$FORK_OF" "ACTIVITY.md")
-      echo "   Hub activity (last 10):"
-      echo "${hub_content}" | tail -10
-      echo ""
-      echo "   Note: For full sync, pull each file you need from the hub."
-      echo "   Your fork is at: ${GIST_ID}"
+    local forks_json
+    forks_json=$(gh api --paginate "/gists/${GIST_ID}/forks" 2>/dev/null || echo "[]")
+
+    # Extract 32-char hex gist IDs (not node_id or other IDs)
+    local fork_ids=()
+    while IFS= read -r fid; do
+      [[ -n "$fid" ]] && fork_ids+=("$fid")
+    done < <(echo "$forks_json" | grep -oP '"id":\s*"\K[a-f0-9]{32}' || true)
+
+    if [[ "${#fork_ids[@]}" -eq 0 ]]; then
+      echo "   No forks found yet."
+      echo "✅ Hub up to date."
+      return 0
     fi
 
-    if [[ "$mode" == "--push-hub" ]]; then
-      echo "⚠️  [SPOKE] Cannot push directly to hub (hub owns the gist)."
-      echo "   Your changes stay in your fork: ${GIST_ID}"
-      echo "   Hub agents will pull from their gist (hub) during sync."
-      echo "   They will NOT see your fork changes automatically."
-      echo ""
-      echo "   To share: seddo send @hub-agent <message>"
-      echo "   Or: open a PR / fork the hub again with fresh changes."
-    fi
+    echo "   Found ${#fork_ids[@]} fork(s). Merging..."
 
-    if [[ -z "$mode" ]]; then
-      echo "🔄 [SPOKE] Syncing your fork..."
-      echo "   Fork gist: ${GIST_ID}"
-      echo "   (Read/Write on your fork, Read on hub)"
-    fi
+    # Read current hub state
+    local hub_inbox hub_activity hub_lessons hub_tasks
+    hub_inbox=$(fetch_file "INBOX.md")
+    hub_activity=$(fetch_file "ACTIVITY.md")
+    hub_lessons=$(fetch_file "LESSONS.md")
+    hub_tasks=$(fetch_file "TASKS.md")
+
+    local merged_count=0
+    for fork_id in "${fork_ids[@]}"; do
+      echo "   Merging fork ${fork_id:0:8}..."
+
+      local fi fi_inbox fi_activity fi_lessons fi_tasks
+      fi_inbox=$(fetch_from "$fork_id" "INBOX.md" 2>/dev/null || echo "")
+      fi_activity=$(fetch_from "$fork_id" "ACTIVITY.md" 2>/dev/null || echo "")
+      fi_lessons=$(fetch_from "$fork_id" "LESSONS.md" 2>/dev/null || echo "")
+      fi_tasks=$(fetch_from "$fork_id" "TASKS.md" 2>/dev/null || echo "")
+
+      [[ -n "$fi_inbox" ]]    && hub_inbox=$(merge_append    "$hub_inbox"    "$fi_inbox")
+      [[ -n "$fi_activity" ]] && hub_activity=$(merge_append "$hub_activity" "$fi_activity")
+      [[ -n "$fi_lessons" ]]  && hub_lessons=$(merge_append  "$hub_lessons"  "$fi_lessons")
+      [[ -n "$fi_tasks" ]]    && hub_tasks=$(merge_tasks     "$hub_tasks"    "$fi_tasks")
+
+      ((merged_count++)) || true
+    done
+
+    echo "   Writing merged content to hub..."
+    edit_file "$GIST_ID" "INBOX.md"    "$hub_inbox"
+    edit_file "$GIST_ID" "ACTIVITY.md" "$hub_activity"
+    edit_file "$GIST_ID" "LESSONS.md"  "$hub_lessons"
+    edit_file "$GIST_ID" "TASKS.md"    "$hub_tasks"
+
+    echo "✅ Hub synced: merged ${merged_count} fork(s) → hub gist (${GIST_ID:0:8}...)"
+
   else
-    # HUB: collect from forks via REGISTRY.md
-    echo "🔄 [HUB] Syncing..."
-    local registry
-    registry=$(fetch_from "$GIST_ID" "REGISTRY.md")
+    # SPOKE: pull hub → merge with own fork → write to fork
+    echo "🔄 [SPOKE] Pulling from hub (${FORK_OF:0:8}...) and merging..."
 
-    if [[ -z "$registry" ]] || ! echo "$registry" | grep -q "^|"; then
-      echo "   No forks registered in REGISTRY.md."
-      echo "   (Other agents will join via seddo join and register themselves)"
-    else
-      echo "   Registered forks:"
-      echo "$registry" | grep "^|" | tail -n +3
+    # Append-only files: merge hub base + spoke's new content
+    for fname in INBOX.md ACTIVITY.md LESSONS.md; do
+      local hub_content fork_content merged
+      hub_content=$(fetch_from "$FORK_OF" "$fname" 2>/dev/null || echo "")
+      fork_content=$(fetch_from "$GIST_ID" "$fname" 2>/dev/null || echo "")
+      if [[ -n "$hub_content" ]]; then
+        merged=$(merge_append "$hub_content" "$fork_content")
+        edit_file "$GIST_ID" "$fname" "$merged"
+      fi
+    done
+
+    # Tasks: block-based merge (hub base + spoke's updates/new tasks)
+    local hub_tasks fork_tasks merged_tasks
+    hub_tasks=$(fetch_from "$FORK_OF" "TASKS.md" 2>/dev/null || echo "")
+    fork_tasks=$(fetch_from "$GIST_ID" "TASKS.md" 2>/dev/null || echo "")
+    if [[ -n "$hub_tasks" ]]; then
+      merged_tasks=$(merge_tasks "$hub_tasks" "$fork_tasks")
+      edit_file "$GIST_ID" "TASKS.md" "$merged_tasks"
     fi
-  fi
 
-  echo ""
-  echo "✅ Sync complete for ${seddo_name}"
+    # Hub-authoritative files: take hub version as-is
+    for fname in ROSTER.md PROTOCOL.md; do
+      local hub_content
+      hub_content=$(fetch_from "$FORK_OF" "$fname" 2>/dev/null || echo "")
+      [[ -n "$hub_content" ]] && edit_file "$GIST_ID" "$fname" "$hub_content"
+    done
+
+    echo "✅ Spoke synced: fork (${GIST_ID:0:8}...) updated from hub"
+  fi
 }
 
 # ── seddo inbox ──────────────────────────────────────────
@@ -827,18 +943,20 @@ cmd_send() {
 
   local ts
   ts=$(now)
-  local gist_to_write="$GIST_ID"
 
   local current_inbox
-  current_inbox=$(fetch_from "$gist_to_write" "INBOX.md")
+  current_inbox=$(fetch_from "$GIST_ID" "INBOX.md")
   local new_msg="→ ${target} : ${message} — @${AGENT_NAME} ${ts}"
-  edit_file "$gist_to_write" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}"
+  edit_file "$GIST_ID" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}"
 
   local current_activity
-  current_activity=$(fetch_from "$gist_to_write" "ACTIVITY.md")
-  edit_file "$gist_to_write" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
+  current_activity=$(fetch_from "$GIST_ID" "ACTIVITY.md")
+  edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
 
-  echo "✅ Message sent to ${target} (via ${gist_to_write:0:8}...)"
+  echo "✅ Message sent to ${target} (via ${GIST_ID:0:8}...)"
+  if [[ "$ROLE" == "spoke" ]]; then
+    echo "   (hub will merge on next: seddo sync)"
+  fi
 }
 
 # ── seddo tasks ─────────────────────────────────────────
@@ -1066,6 +1184,14 @@ cmd_doctor() {
     else
       echo "   ❌ Cannot access gist"
     fi
+
+    if [[ "$ROLE" == "spoke" ]] && [[ -n "$FORK_OF" ]]; then
+      if gh gist view "$FORK_OF" &>/dev/null 2>&1; then
+        echo "   ✅ Hub gist accessible (${FORK_OF:0:8}...)"
+      else
+        echo "   ❌ Hub gist not accessible (${FORK_OF:0:8}...)"
+      fi
+    fi
   else
     echo "⚠️  No active seddo"
     echo "   Run: seddo init   or   seddo join <gist-id>"
@@ -1080,7 +1206,6 @@ cmd_doctor() {
 
 # ─── MAIN ──────────────────────────────────────────────
 
-# Load active seddo if any
 load_active_seddo 2>/dev/null || true
 
 case "${1:-help}" in
@@ -1090,7 +1215,7 @@ case "${1:-help}" in
   switch)        cmd_switch "${2:-}" ;;
   remove)        cmd_remove "${2:-}" ;;
   status)        cmd_status ;;
-  sync)          cmd_sync "${2:-}" "${3:-}" ;;
+  sync)          cmd_sync "${2:-}" ;;
   inbox)         cmd_inbox ;;
   send)          cmd_send "$2" "${@:3}" ;;
   tasks)         cmd_tasks ;;
@@ -1098,7 +1223,7 @@ case "${1:-help}" in
   claim)         cmd_claim "${2:-}" ;;
   update)        cmd_update "${2:-}" "${3:-WIP}" ;;
   done)          cmd_done "${2:-}" "${@:3}" ;;
-  lesson)        cmd_lesson "${2:-}" "${2:-process}" ;;
+  lesson)        cmd_lesson "${2:-}" "${3:-process}" ;;
   log)           cmd_log ;;
   info)          cmd_info ;;
   doctor)        cmd_doctor ;;
@@ -1111,12 +1236,13 @@ case "${1:-help}" in
     echo "Setup:"
     echo "  init                  Create a new hub seddo (creates a gist)"
     echo "  join <gist-id>        Fork and join an existing seddo"
-    echo "  list                  Show all seddos on this machine"
+    echo "  list                  Show all seddos on this machine (~/.seddo.d/)"
     echo "  switch <name>         Switch to another seddo"
     echo "  remove <name>         Remove a seddo workspace (local only)"
     echo ""
     echo "Work:"
-    echo "  sync [--pull-hub|--push-hub]  Sync (spoke: pull/push hub; hub: show forks)"
+    echo "  sync                  Hub: merge all forks → hub gist"
+    echo "                        Spoke: pull hub → merge into fork"
     echo "  inbox                 Read messages"
     echo "  send @agent msg       Send a message"
     echo "  tasks                 List tasks"
@@ -1134,7 +1260,7 @@ case "${1:-help}" in
     echo "  help                  This help"
     echo ""
     echo "Environment:"
-    echo "  SEDDO_ROOT            Workspace root (default: ~/.seddo)"
+    echo "  SEDDO_ROOT            Workspace root (default: ~/.seddo.d)"
     echo "  SWARM_GIST_ID         Override gist ID"
     echo "  SEDDO_AGENT           Override agent name"
     ;;
