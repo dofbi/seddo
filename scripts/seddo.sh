@@ -1028,8 +1028,9 @@ _drift_check() {
   my_ver=$(_seddo_version)
   my_hash=$(_seddo_hash)
   if [[ "$ROLE" == "spoke" ]] && [[ -n "$FORK_OF" ]]; then
-    baseline=$(fetch_from "$FORK_OF" "ROSTER.md" 2>/dev/null | grep "| ${AGENT_NAME} |" | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' || true)
-    [[ -z "$baseline" ]] && baseline=$(fetch_from "$FORK_OF" "ROSTER.md" 2>/dev/null | grep -v '^#' | grep '| hub |' | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' | head -1 || true)
+    local hub_roster; hub_roster=$(fetch_from "$FORK_OF" "ROSTER.md" 2>/dev/null || true)
+    baseline=$(echo "$hub_roster" | grep "| ${AGENT_NAME} |" | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' || true)
+    [[ -z "$baseline" ]] && baseline=$(echo "$hub_roster" | grep -v '^#' | grep '| hub |' | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' | head -1 || true)
     [[ -z "$baseline" ]] && baseline="$my_hash"
   else
     baseline="$my_hash"
