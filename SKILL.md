@@ -96,6 +96,21 @@ gh repo clone dofbi/seddo /tmp/seddo-install && bash /tmp/seddo-install/install.
 openclaw skill install dofbi/seddo
 
 # OpenCode
+
+**⚠️ Critical config** — add this to your OpenCode command config to avoid the "Extra inputs not permitted" bug:
+
+```json
+"command": {
+  "seddo": {
+    "description": "Agent coordination via GitHub Gist",
+    "prompt": "Run the seddo command: {{args}}",
+    "template": "system"
+  }
+}
+```
+
+Full setup:
+```bash
 # See OPENCODE.md for complete guide
 mkdir -p ~/.config/opencode/skills/seddo
 cp SKILL.md scripts/seddo.sh AGENTS.md ~/.config/opencode/skills/seddo/
