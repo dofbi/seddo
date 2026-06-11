@@ -17,7 +17,16 @@ set -euo pipefail
 
 SEDDO_ROOT="${SEDDO_ROOT:-$HOME/.seddo.d}"
 SEDDO_ACTIVE_FILE="${SEDDO_ROOT}/active"
-SEDDO_VERSION="2.1.0"
+# Version: auto-detected from git tag or SHA if available
+SEDDO_VERSION="2.5.2"
+_seddo_version() {
+  local git_dir="$(dirname "$0")/../.git"
+  if [[ -d "$git_dir" ]]; then
+    git --git-dir="$git_dir" describe --tags 2>/dev/null || git --git-dir="$git_dir" rev-parse --short HEAD 2>/dev/null || echo "$SEDDO_VERSION"
+  else
+    echo "$SEDDO_VERSION"
+  fi
+}
 
 # Per-seddo paths (set by load_config)
 seddo_name=""
@@ -150,13 +159,25 @@ extract_gist_id() {
 
 fetch_file() {
   local filename="$1"
-  gh gist view "$GIST_ID" -f "$filename" 2>/dev/null || echo ""
+  local out
+  if ! out=$(gh gist view "$GIST_ID" -f "$filename" 2>&1); then
+    echo "❌ fetch_file: failed to fetch ${filename} from gist ${GIST_ID:0:8}..." >&2
+    echo "   ${out}" >&2
+    return 1
+  fi
+  printf '%s' "$out"
 }
 
 fetch_from() {
   local gist_id="$1"
   local filename="$2"
-  gh gist view "$gist_id" -f "$filename" 2>/dev/null || echo ""
+  local out
+  if ! out=$(gh gist view "$gist_id" -f "$filename" 2>&1); then
+    echo "❌ fetch_from: failed to fetch ${filename} from gist ${gist_id:0:8}..." >&2
+    echo "   ${out}" >&2
+    return 1
+  fi
+  printf '%s' "$out"
 }
 
 list_forks() {
@@ -704,6 +725,19 @@ EOF
 }
 EOF
 
+  # Auto-enroll: register in spoke fork ROSTER.md and log arrival
+  local ts; ts=$(now)
+  local roster
+  roster=$(fetch_from "$fork_id" "ROSTER.md" 2>/dev/null || true)
+  local new_roster="${roster}
+- ${agent_name} | ${canonical_url} | ${ts} | fork"
+  edit_file "$fork_id" "ROSTER.md" "$new_roster"
+  local inbox
+  inbox=$(fetch_from "$fork_id" "INBOX.md" 2>/dev/null || true)
+  local new_inbox="${inbox}
+→ @all : Joined the seddo — @${agent_name} ${ts}"
+  edit_file "$fork_id" "INBOX.md" "$new_inbox"
+
   echo ""
   echo "✅ Joined seddo « ${local_name} » as @${agent_name}"
   echo "   Role     : SPOKE (fork of hub)"
@@ -887,20 +921,20 @@ cmd_sync() {
 
     # Read current hub state
     local hub_inbox hub_activity hub_lessons hub_tasks
-    hub_inbox=$(fetch_file "INBOX.md")
-    hub_activity=$(fetch_file "ACTIVITY.md")
-    hub_lessons=$(fetch_file "LESSONS.md")
-    hub_tasks=$(fetch_file "TASKS.md")
+    hub_inbox=$(fetch_file "INBOX.md") || { echo "❌ Abort sync: fetch hub INBOX.md failed" >&2; exit 1; }
+    hub_activity=$(fetch_file "ACTIVITY.md") || { echo "❌ Abort sync: fetch hub ACTIVITY.md failed" >&2; exit 1; }
+    hub_lessons=$(fetch_file "LESSONS.md") || { echo "❌ Abort sync: fetch hub LESSONS.md failed" >&2; exit 1; }
+    hub_tasks=$(fetch_file "TASKS.md") || { echo "❌ Abort sync: fetch hub TASKS.md failed" >&2; exit 1; }
 
     local merged_count=0
     for fork_id in "${fork_ids[@]}"; do
       echo "   Merging fork ${fork_id:0:8}..."
 
-      local fi fi_inbox fi_activity fi_lessons fi_tasks
-      fi_inbox=$(fetch_from "$fork_id" "INBOX.md" 2>/dev/null || echo "")
-      fi_activity=$(fetch_from "$fork_id" "ACTIVITY.md" 2>/dev/null || echo "")
-      fi_lessons=$(fetch_from "$fork_id" "LESSONS.md" 2>/dev/null || echo "")
-      fi_tasks=$(fetch_from "$fork_id" "TASKS.md" 2>/dev/null || echo "")
+      local fi_inbox fi_activity fi_lessons fi_tasks
+      fi_inbox=$(fetch_from "$fork_id" "INBOX.md" 2>/dev/null || true)
+      fi_activity=$(fetch_from "$fork_id" "ACTIVITY.md" 2>/dev/null || true)
+      fi_lessons=$(fetch_from "$fork_id" "LESSONS.md" 2>/dev/null || true)
+      fi_tasks=$(fetch_from "$fork_id" "TASKS.md" 2>/dev/null || true)
 
       [[ -n "$fi_inbox" ]]    && hub_inbox=$(merge_append    "$hub_inbox"    "$fi_inbox")
       [[ -n "$fi_activity" ]] && hub_activity=$(merge_append "$hub_activity" "$fi_activity")
@@ -911,10 +945,11 @@ cmd_sync() {
     done
 
     echo "   Writing merged content to hub..."
-    edit_file "$GIST_ID" "INBOX.md"    "$hub_inbox"
-    edit_file "$GIST_ID" "ACTIVITY.md" "$hub_activity"
-    edit_file "$GIST_ID" "LESSONS.md"  "$hub_lessons"
-    edit_file "$GIST_ID" "TASKS.md"    "$hub_tasks"
+    edit_files "$GIST_ID" \
+      "INBOX.md"    "$hub_inbox" \
+      "ACTIVITY.md" "$hub_activity" \
+      "LESSONS.md"  "$hub_lessons" \
+      "TASKS.md"    "$hub_tasks"
 
     echo "✅ Hub synced: merged ${merged_count} fork(s) → hub gist (${GIST_ID:0:8}...)"
 
@@ -923,24 +958,29 @@ cmd_sync() {
     echo "🔄 [SPOKE] Pulling from hub (${FORK_OF:0:8}...) and merging..."
 
     # Append-only files: merge hub base + spoke's new content
-    for fname in INBOX.md ACTIVITY.md LESSONS.md; do
-      local hub_content fork_content merged
-      hub_content=$(fetch_from "$FORK_OF" "$fname" 2>/dev/null || echo "")
-      fork_content=$(fetch_from "$GIST_ID" "$fname" 2>/dev/null || echo "")
-      if [[ -n "$hub_content" ]]; then
-        merged=$(merge_append "$hub_content" "$fork_content")
-        edit_file "$GIST_ID" "$fname" "$merged"
-      fi
-    done
+    local hub_inbox hub_activity hub_lessons hub_tasks
+    hub_inbox=$(fetch_from "$FORK_OF" "INBOX.md" 2>/dev/null || true)
+    hub_activity=$(fetch_from "$FORK_OF" "ACTIVITY.md" 2>/dev/null || true)
+    hub_lessons=$(fetch_from "$FORK_OF" "LESSONS.md" 2>/dev/null || true)
+    hub_tasks=$(fetch_from "$FORK_OF" "TASKS.md" 2>/dev/null || true)
 
-    # Tasks: block-based merge (hub base + spoke's updates/new tasks)
-    local hub_tasks fork_tasks merged_tasks
-    hub_tasks=$(fetch_from "$FORK_OF" "TASKS.md" 2>/dev/null || echo "")
-    fork_tasks=$(fetch_from "$GIST_ID" "TASKS.md" 2>/dev/null || echo "")
-    if [[ -n "$hub_tasks" ]]; then
-      merged_tasks=$(merge_tasks "$hub_tasks" "$fork_tasks")
-      edit_file "$GIST_ID" "TASKS.md" "$merged_tasks"
-    fi
+    local fork_inbox fork_activity fork_lessons fork_tasks
+    fork_inbox=$(fetch_from "$GIST_ID" "INBOX.md" 2>/dev/null || true)
+    fork_activity=$(fetch_from "$GIST_ID" "ACTIVITY.md" 2>/dev/null || true)
+    fork_lessons=$(fetch_from "$GIST_ID" "LESSONS.md" 2>/dev/null || true)
+    fork_tasks=$(fetch_from "$GIST_ID" "TASKS.md" 2>/dev/null || true)
+
+    local merged_inbox merged_activity merged_lessons merged_tasks
+    merged_inbox=$(merge_append "$hub_inbox" "$fork_inbox")
+    merged_activity=$(merge_append "$hub_activity" "$fork_activity")
+    merged_lessons=$(merge_append "$hub_lessons" "$fork_lessons")
+    merged_tasks=$(merge_tasks "$hub_tasks" "$fork_tasks")
+
+    edit_files "$GIST_ID" \
+      "INBOX.md"    "$merged_inbox" \
+      "ACTIVITY.md" "$merged_activity" \
+      "LESSONS.md"  "$merged_lessons" \
+      "TASKS.md"    "$merged_tasks"
 
     # Hub-authoritative files: take hub version as-is
     for fname in ROSTER.md PROTOCOL.md; do
@@ -1006,9 +1046,9 @@ cmd_send() {
   ts=$(now)
 
   local current_inbox
-  current_inbox=$(fetch_from "$GIST_ID" "INBOX.md")
+  current_inbox=$(fetch_from "$GIST_ID" "INBOX.md") || { echo "❌ Abort: fetch INBOX.md failed" >&2; exit 1; }
   local current_activity
-  current_activity=$(fetch_from "$GIST_ID" "ACTIVITY.md")
+  current_activity=$(fetch_from "$GIST_ID" "ACTIVITY.md") || { echo "❌ Abort: fetch ACTIVITY.md failed" >&2; exit 1; }
   local new_msg="→ ${target} : ${message} — @${AGENT_NAME} ${ts}"
   edit_files "$GIST_ID" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
 
@@ -1096,11 +1136,11 @@ cmd_add() {
   ts=$(now)
 
   local current_tasks
-  current_tasks=$(fetch_file "TASKS.md")
+  current_tasks=$(fetch_file "TASKS.md") || { echo "❌ Abort: fetch TASKS.md failed" >&2; exit 1; }
   local count
   count=$(echo "$current_tasks" | grep -c '^### T-' || true)
   local task_id
-  task_id=$(printf "T-%03d" "$((count + 1))")
+  task_id=$(printf "T-%03d-%s-%s" "$((count + 1))" "${AGENT_NAME}" "$(date +%s | tail -c 5)")
 
   local new_task="
 ### ${task_id}: ${title}
