@@ -966,14 +966,15 @@ cmd_inbox() {
   if $json_mode; then
     local first=true
     echo "{\"inbox\":["
-    echo "$content" | grep -v '^<!--' | grep -v '^Format:' | grep -v '^Status:' | grep -v '^-->' | grep -v '^$' | grep -v '^#' | grep -v '^---' | grep -v '^$' | tail -n +2 \
+    # Strip template lines and comments before parsing
+    echo "$content" | grep -v '^<!--' | grep -v '^Format:' | grep -v '^Status:' | grep -v '^-->' | grep -v '^$' | grep -v '^#' | grep -v '^---' | grep -v '^→ @agent : message' \
     | while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       local target msg sender ts
-      target=$(echo "$line" | sed -n 's/^→ \(@[^ :]*\).*/\1/p')
+      target=$(echo "$line" | sed -n 's/^[✓ ]*→ \(@[^ :]*\).*/\1/p')
       sender=$(echo "$line" | sed -n 's/.*— \(@[^ ]*\).*/\1/p')
       ts=$(echo "$line" | sed -n 's/.* \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}:[0-9]\{2\}Z\).*/\1/p' | sed 's/✅//; s/⏳//')
-      msg=$(echo "$line" | sed -n 's/^→ @[^ :]* : \(.*\) — @[^ ]*.*/\1/p')
+      msg=$(echo "$line" | sed -n 's/^[✓ ]*→ @[^ :]* : \(.*\) — @[^ ]*.*/\1/p')
       [[ -n "$msg" ]] || msg="$line"
       local escaped_msg
       escaped_msg=$(json_escape "$msg")
@@ -992,7 +993,11 @@ cmd_inbox() {
 
 # ── seddo send ──────────────────────────────────────────
 cmd_send() {
-  local target="$1"
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "Usage: seddo send @target message"
+    exit 1
+  fi
   shift
   local message="$*"
   require_seddo
@@ -1026,25 +1031,37 @@ cmd_tasks() {
   if $json_mode; then
     echo "{\"tasks\":["
     local first_entry=true
-    # Strip HTML comment blocks (template header) before parsing
-    echo "$content" | sed '/^<!--/,/^-->/d' | sed 's/✅//g' | sed 's/⏳//g' | awk '
+    # Strip HTML comment blocks before parsing; extract T-XXX from header
+    echo "$content" | sed '/^<!--/,/^-->/d' | awk '
+      BEGIN { first_entry = 1 }
       /^### T-/ {
         if (id != "") {
           gsub(/"/, "\\\"", title)
           if (!first_entry) print ","
-          first_entry = false
+          first_entry = 0
           printf "  {\"id\":\"%s\",\"status\":\"%s\",\"assigned\":\"%s\",\"priority\":\"%s\",\"title\":\"%s\"}", id, status, assigned, priority, title
         }
-        split($0, a, ": "); id = a[2]
-        gsub(/^[ \t]+/, "", id)
-        status = "OPEN"; assigned = "@any"; priority = "MEDIUM"; title = ""
+        # Extract id from "### T-XXX: Title" — match T-[0-9]+ at start
+        match($0, /T-[0-9]+/); id = substr($0, RSTART, RLENGTH)
+        # Extract title after ": "
+        split($0, a, ": "); title = a[2]
+        gsub(/^[ \t]+/, "", title)
+        status = "OPEN"; assigned = "@any"; priority = "MEDIUM"
+        next
       }
-      /^\- status:/ { sub("- status: ", ""); status = $0 }
-      /^\- assigned:/ { sub("- assigned: ", ""); assigned = $0 }
-      /^\- priority:/ { sub("- priority: ", ""); priority = $0 }
+      /^\- status:/ { sub("- status: ", ""); status = $0; next }
+      /^\- assigned:/ { sub("- assigned: ", ""); assigned = $0; next }
+      /^\- priority:/ { sub("- priority: ", ""); priority = $0; next }
+      /^\- input:/ { next }
+      /^\- output:/ { next }
+      /^\- created:/ { next }
+      /^\- updated:/ { next }
       /^$|^#|^---/ { next }
-      /^[ \t]*[^- ]/ && id != "" {
-        desc = substr($0, 4); title = (title == "" ? desc : title " " desc)
+      id != "" && desc ~ /^(input|output|created|updated):/ { next }
+      id != "" {
+        desc = $0; gsub(/^[ \t]+/, "", desc)
+        if (desc ~ /^(✅|⏳|✓)/) { desc = substr(desc, 4); gsub(/^[ \t]+/, "", desc) }
+        title = (title == "" ? desc : title " " desc)
       }
       END {
         if (id != "") {
@@ -1409,7 +1426,7 @@ case "${1:-help}" in
   who)           cmd_who ;;
   sync)          cmd_sync "${2:-}" ;;
   inbox)         cmd_inbox "${2:-}" ;;
-  send)          cmd_send "$2" "${@:3}" ;;
+  send)          cmd_send "${2:-}" "${@:3}" ;;
   tasks)         cmd_tasks "${2:-}" ;;
   add)           cmd_add "${2:-}" "${3:-MEDIUM}" "${4:-@any}" ;;
   claim)         cmd_claim "${2:-}" ;;
