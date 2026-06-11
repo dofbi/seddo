@@ -30,7 +30,8 @@ _seddo_version() {
 
 _seddo_hash() {
   if command -v sha256sum &>/dev/null; then
-    sha256sum "$0" 2>/dev/null | cut -c1-12 || echo "unknown"
+    local dir; dir="$(cd "$(dirname "$0")/.." && pwd)"
+    cat "${dir}/SKILL.md" "$0" "${dir}/AGENTS.md" 2>/dev/null | sha256sum | cut -c1-12 || echo "unknown"
   else
     echo "unknown"
   fi
