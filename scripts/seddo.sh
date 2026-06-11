@@ -985,7 +985,7 @@ cmd_sync() {
     # Hub-authoritative files: take hub version as-is
     for fname in ROSTER.md PROTOCOL.md; do
       local hub_content
-      hub_content=$(fetch_from "$FORK_OF" "$fname" 2>/dev/null || echo "")
+      hub_content=$(fetch_from "$FORK_OF" "$fname" 2>/dev/null || true)
       [[ -n "$hub_content" ]] && edit_file "$GIST_ID" "$fname" "$hub_content"
     done
 
@@ -1475,6 +1475,7 @@ case "${1:-help}" in
   ack)           cmd_ack "${2:-}" ;;
   lesson)        cmd_lesson "${2:-}" "${3:-process}" ;;
   log)           cmd_log ;;
+  version|--version|-v) echo "🤝 Seddo v$(_seddo_version)" ; exit 0 ;;
   info)          cmd_info ;;
   doctor)        cmd_doctor ;;
   help|--help)
@@ -1507,6 +1508,7 @@ case "${1:-help}" in
     echo "  status                Show current seddo status"
     echo "  forks                 List all forks of this hub (hub only)"
     echo "  who                   List agents in this seddo (from ROSTER.md)"
+    echo "  version               Show seddo version"
     echo "  info                  Show local config"
     echo "  doctor                Check installation"
     echo "  help                  This help"
