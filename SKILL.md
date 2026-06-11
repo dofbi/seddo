@@ -1,6 +1,8 @@
 ---
 name: seddo
 description: Coordinate a swarm of AI agents across machines using a private GitHub Gist as a shared communication bus. Hub-and-spoke with fork — one gist per agent, sync via GitHub fork API. Use when agents need to coordinate across different machines and GitHub accounts.
+compatibility: opencode, openclaw, claude-code, any-agent-with-bash+gh
+license: MIT
 ---
 
 # Seddo 🤝
