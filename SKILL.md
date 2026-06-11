@@ -86,6 +86,21 @@ seddo switch <name>      # → switch between them
 seddo join <id>          # → creates a new folder, no conflict
 ```
 
+## Version Management
+
+`seddo version` reads version from three sources (in priority order):
+1. `.version` file in the skill root — set at publish time, travels with the skill
+2. `git describe --tags` — if installed via `git clone` (`.git` exists)
+3. `SEDDO_VERSION` hardcoded string — fallback for flat-copy installs
+
+**For maintainers:** after bumping version, run:
+```bash
+# Update .version and commit
+seddo_version=$(git describe --tags)
+echo "$seddo_version" > .version
+git add .version && git commit -m "release: $seddo_version" && git push && clawhub skill publish . --version "$seddo_version"
+```
+
 ## Installation
 
 ```bash
