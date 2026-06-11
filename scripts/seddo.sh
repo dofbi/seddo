@@ -28,6 +28,14 @@ _seddo_version() {
   fi
 }
 
+_seddo_hash() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum "$0" 2>/dev/null | cut -c1-12 || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+
 # Per-seddo paths (set by load_config)
 seddo_name=""
 seddo_config=""
@@ -729,8 +737,10 @@ EOF
   local ts; ts=$(now)
   local roster
   roster=$(fetch_from "$fork_id" "ROSTER.md" 2>/dev/null || true)
+  local ver; ver=$(_seddo_version)
+  local hash; hash=$(_seddo_hash)
   local new_roster="${roster}
-- ${agent_name} | ${canonical_url} | ${ts} | fork"
+- ${agent_name} | ${canonical_url} | ${ts} | fork | v${ver} | sha:${hash}"
   edit_file "$fork_id" "ROSTER.md" "$new_roster"
   local inbox
   inbox=$(fetch_from "$fork_id" "INBOX.md" 2>/dev/null || true)
@@ -989,7 +999,67 @@ cmd_sync() {
       [[ -n "$hub_content" ]] && edit_file "$GIST_ID" "$fname" "$hub_content"
     done
 
+    # Refresh own ROSTER row with current version/hash
+    local ts my_ver my_hash
+    ts=$(now)
+    my_ver=$(_seddo_version)
+    my_hash=$(_seddo_hash)
+    local roster
+    roster=$(fetch_from "$GIST_ID" "ROSTER.md" 2>/dev/null || true)
+    local new_row="- ${AGENT_NAME} | ${GIST_URL} | ${ts} | fork | v${my_ver} | sha:${my_hash}"
+    # Remove old row for this agent, append new
+    local cleaned
+    cleaned=$(echo "$roster" | grep -v "| ${AGENT_NAME} |" || true)
+    edit_file "$GIST_ID" "ROSTER.md" "${cleaned}${new_row}"
+
     echo "✅ Spoke synced: fork (${GIST_ID:0:8}...) updated from hub"
+  fi
+
+  # --- Drift detection at end of sync ---
+  _drift_check
+}
+
+# Drift detection: compare version/hash across agents in ROSTER.md
+_drift_check() {
+  local my_ver my_hash
+  my_ver=$(_seddo_version)
+  my_hash=$(_seddo_hash)
+  echo ""
+  echo "🔎 Skill consistency:"
+  local roster_content
+  roster_content=$(fetch_file "ROSTER.md" 2>/dev/null || true)
+  if [[ -n "$roster_content" ]]; then
+    local drift_count=0
+    local row agent ver hash_marker hash
+    while IFS= read -r row; do
+      [[ -z "$row" ]] && continue
+      [[ "$row" == "#"* ]] && continue
+      agent=$(echo "$row" | awk -F'|' '{print $1}' | sed 's/^- //; s/^[ \t]*//; s/[ \t]*$//')
+      ver=$(echo "$row" | awk -F'|' '{print $5}' | sed 's/^[ \t]*//; s/[ \t]*$//')
+      hash_marker=$(echo "$row" | awk -F'|' '{print $6}' | sed 's/^[ \t]*//; s/[ \t]*$//')
+      hash=$(echo "$hash_marker" | sed 's/sha://')
+      [[ -z "$agent" ]] && continue
+      local marker=""
+      if [[ "$agent" == "$AGENT_NAME" ]]; then marker=" (you)"; fi
+      if [[ "$hash" == "unknown" ]] || [[ "$my_hash" == "unknown" ]]; then
+        echo "   @${agent} ${ver}${marker}"
+      elif [[ "$hash" == "$my_hash" ]]; then
+        echo "   @${agent} ${ver} sha:${hash}${marker}"
+      else
+        echo "   @${agent} ${ver} sha:${hash} ⚠️ DRIFT${marker}"
+        ((drift_count++)) || true
+      fi
+    done <<< "$roster_content"
+    if [[ "$drift_count" -gt 0 ]]; then
+      echo ""
+      echo "⚠️  ${drift_count} agent(s) run different code (hash mismatch)."
+      echo "   Ask them to resync the skill (openclaw skills update seddo)."
+    else
+      echo ""
+      echo "✅ All agents on identical skill build."
+    fi
+  else
+    echo "   (no ROSTER.md — drift detection unavailable)"
   fi
 }
 
@@ -1381,6 +1451,50 @@ cmd_doctor() {
   else
     echo "⚠️  No active seddo"
     echo "   Run: seddo init   or   seddo join <gist-id>"
+  fi
+
+  # --- Skill drift detection ---
+  if [[ -n "$GIST_ID" ]]; then
+    local my_ver my_hash
+    my_ver=$(_seddo_version)
+    my_hash=$(_seddo_hash)
+    echo ""
+    echo "🔎 Skill consistency:"
+    local roster_content
+    roster_content=$(fetch_file "ROSTER.md" 2>/dev/null || true)
+    if [[ -n "$roster_content" ]]; then
+      local drift_count=0
+      local row agent ver hash_marker hash
+      while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        [[ "$row" == "#"* ]] && continue
+        agent=$(echo "$row" | awk -F'|' '{print $1}' | sed 's/^- //; s/^[ \t]*//; s/[ \t]*$//')
+        ver=$(echo "$row" | awk -F'|' '{print $5}' | sed 's/^[ \t]*//; s/[ \t]*$//')
+        hash_marker=$(echo "$row" | awk -F'|' '{print $6}' | sed 's/^[ \t]*//; s/[ \t]*$//')
+        hash=$(echo "$hash_marker" | sed 's/sha://')
+        [[ -z "$agent" ]] && continue
+        local marker=""
+        if [[ "$agent" == "$AGENT_NAME" ]]; then marker=" (you)"; fi
+        if [[ "$hash" == "unknown" ]] || [[ "$my_hash" == "unknown" ]]; then
+          echo "   @${agent} ${ver}${marker}"
+        elif [[ "$hash" == "$my_hash" ]]; then
+          echo "   @${agent} ${ver} sha:${hash}${marker}"
+        else
+          echo "   @${agent} ${ver} sha:${hash} ⚠️ DRIFT${marker}"
+          ((drift_count++)) || true
+        fi
+      done <<< "$roster_content"
+      if [[ "$drift_count" -gt 0 ]]; then
+        echo ""
+        echo "⚠️  ${drift_count} agent(s) run different code (hash mismatch)."
+        echo "   Ask them to resync the skill (openclaw skills update seddo)."
+      else
+        echo ""
+        echo "✅ All agents on identical skill build."
+      fi
+    else
+      echo "   (no ROSTER.md — drift detection unavailable)"
+    fi
   fi
 
   echo ""
