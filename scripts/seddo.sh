@@ -1020,10 +1020,19 @@ cmd_sync() {
 }
 
 # Drift detection: compare version/hash across agents in ROSTER.md
+# Hub: baseline = own hash. Spoke: baseline = hub hash (canonical source).
+# Returns 1 if drift detected, 0 otherwise.
 _drift_check() {
-  local my_ver my_hash
+  local my_ver my_hash baseline
   my_ver=$(_seddo_version)
   my_hash=$(_seddo_hash)
+  if [[ "$ROLE" == "spoke" ]] && [[ -n "$FORK_OF" ]]; then
+    baseline=$(fetch_from "$FORK_OF" "ROSTER.md" 2>/dev/null | grep "| ${AGENT_NAME} |" | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' || true)
+    [[ -z "$baseline" ]] && baseline=$(fetch_from "$FORK_OF" "ROSTER.md" 2>/dev/null | grep -v '^#' | grep '| hub |' | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' | head -1 || true)
+    [[ -z "$baseline" ]] && baseline="$my_hash"
+  else
+    baseline="$my_hash"
+  fi
   echo ""
   echo "🔎 Skill consistency:"
   local roster_content
@@ -1041,12 +1050,17 @@ _drift_check() {
       [[ -z "$agent" ]] && continue
       local marker=""
       if [[ "$agent" == "$AGENT_NAME" ]]; then marker=" (you)"; fi
-      if [[ "$hash" == "unknown" ]] || [[ "$my_hash" == "unknown" ]]; then
+      if [[ "$hash" == "unknown" ]] || [[ "$baseline" == "unknown" ]]; then
         echo "   @${agent} ${ver}${marker}"
-      elif [[ "$hash" == "$my_hash" ]]; then
+      elif [[ "$hash" == "$baseline" ]]; then
         echo "   @${agent} ${ver} sha:${hash}${marker}"
       else
-        echo "   @${agent} ${ver} sha:${hash} ⚠️ DRIFT${marker}"
+        local msg=""
+        if [[ "$agent" == "$AGENT_NAME" ]]; then
+          echo "   @${agent} ${ver} sha:${hash} ⚠️ BEHIND HUB${marker}"
+        else
+          echo "   @${agent} ${ver} sha:${hash} ⚠️ DRIFT${marker}"
+        fi
         ((drift_count++)) || true
       fi
     done <<< "$roster_content"
@@ -1054,12 +1068,15 @@ _drift_check() {
       echo ""
       echo "⚠️  ${drift_count} agent(s) run different code (hash mismatch)."
       echo "   Ask them to resync the skill (openclaw skills update seddo)."
+      return 1
     else
       echo ""
       echo "✅ All agents on identical skill build."
+      return 0
     fi
   else
     echo "   (no ROSTER.md — drift detection unavailable)"
+    return 0
   fi
 }
 
@@ -1454,48 +1471,7 @@ cmd_doctor() {
   fi
 
   # --- Skill drift detection ---
-  if [[ -n "$GIST_ID" ]]; then
-    local my_ver my_hash
-    my_ver=$(_seddo_version)
-    my_hash=$(_seddo_hash)
-    echo ""
-    echo "🔎 Skill consistency:"
-    local roster_content
-    roster_content=$(fetch_file "ROSTER.md" 2>/dev/null || true)
-    if [[ -n "$roster_content" ]]; then
-      local drift_count=0
-      local row agent ver hash_marker hash
-      while IFS= read -r row; do
-        [[ -z "$row" ]] && continue
-        [[ "$row" == "#"* ]] && continue
-        agent=$(echo "$row" | awk -F'|' '{print $1}' | sed 's/^- //; s/^[ \t]*//; s/[ \t]*$//')
-        ver=$(echo "$row" | awk -F'|' '{print $5}' | sed 's/^[ \t]*//; s/[ \t]*$//')
-        hash_marker=$(echo "$row" | awk -F'|' '{print $6}' | sed 's/^[ \t]*//; s/[ \t]*$//')
-        hash=$(echo "$hash_marker" | sed 's/sha://')
-        [[ -z "$agent" ]] && continue
-        local marker=""
-        if [[ "$agent" == "$AGENT_NAME" ]]; then marker=" (you)"; fi
-        if [[ "$hash" == "unknown" ]] || [[ "$my_hash" == "unknown" ]]; then
-          echo "   @${agent} ${ver}${marker}"
-        elif [[ "$hash" == "$my_hash" ]]; then
-          echo "   @${agent} ${ver} sha:${hash}${marker}"
-        else
-          echo "   @${agent} ${ver} sha:${hash} ⚠️ DRIFT${marker}"
-          ((drift_count++)) || true
-        fi
-      done <<< "$roster_content"
-      if [[ "$drift_count" -gt 0 ]]; then
-        echo ""
-        echo "⚠️  ${drift_count} agent(s) run different code (hash mismatch)."
-        echo "   Ask them to resync the skill (openclaw skills update seddo)."
-      else
-        echo ""
-        echo "✅ All agents on identical skill build."
-      fi
-    else
-      echo "   (no ROSTER.md — drift detection unavailable)"
-    fi
-  fi
+  [[ -n "$GIST_ID" ]] && _drift_check
 
   echo ""
   echo "   Available seddos:"
