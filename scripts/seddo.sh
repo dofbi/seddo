@@ -243,70 +243,68 @@ merge_append() {
 merge_tasks() {
   local base="$1"
   local incoming="$2"
+  # Implemented in awk to avoid bash associative-array + set -u incompatibilities.
+  # Sentinel separates base from incoming; last-write-wins by updated: timestamp.
+  printf '%s\n---SEDDO_MERGE_INCOMING---\n%s\n' "$base" "$incoming" | awk '
+    BEGIN { mode="base"; in_block=0; cur_id=""; cur_block=""; preamble="" }
 
-  local preamble
-  preamble=$(awk '/^### T-/{exit} {print}' <<< "$base")
+    /^### T-[0-9]+:/ {
+      if (cur_id != "") {
+        if (mode == "base") base_block[cur_id] = cur_block
+        else                inc_block[cur_id]  = cur_block
+      }
+      cur_id = $0
+      sub(/^### /, "", cur_id)
+      sub(/:.*$/,  "", cur_id)
+      cur_block = $0 "\n"
+      in_block = 1
+      next
+    }
 
-  declare -A base_blocks base_ts inc_blocks inc_ts
+    /^---SEDDO_MERGE_INCOMING---$/ {
+      if (cur_id != "") { base_block[cur_id] = cur_block; cur_id = ""; cur_block = "" }
+      mode = "incoming"; in_block = 0
+      next
+    }
 
-  local cur_id="" cur_block=""
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^###\ T-([0-9]+): ]]; then
-      [[ -n "$cur_id" ]] && base_blocks["$cur_id"]="$cur_block"
-      cur_id="T-${BASH_REMATCH[1]}"
-      cur_block="$line"$'\n'
-    elif [[ -n "$cur_id" ]]; then
-      cur_block+="$line"$'\n'
-      if [[ "$line" =~ ^-\ updated:\ (.+) ]]; then
-        base_ts["$cur_id"]="${BASH_REMATCH[1]}"
-      fi
-    fi
-  done <<< "$base"
-  [[ -n "$cur_id" ]] && base_blocks["$cur_id"]="$cur_block"
+    in_block {
+      cur_block = cur_block $0 "\n"
+      if (match($0, /^- updated: /)) {
+        ts = substr($0, RSTART + length("- updated: "))
+        if (mode == "base") base_ts[cur_id] = ts
+        else                inc_ts[cur_id]  = ts
+      }
+      next
+    }
 
-  cur_id="" cur_block=""
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^###\ T-([0-9]+): ]]; then
-      [[ -n "$cur_id" ]] && inc_blocks["$cur_id"]="$cur_block"
-      cur_id="T-${BASH_REMATCH[1]}"
-      cur_block="$line"$'\n'
-    elif [[ -n "$cur_id" ]]; then
-      cur_block+="$line"$'\n'
-      if [[ "$line" =~ ^-\ updated:\ (.+) ]]; then
-        inc_ts["$cur_id"]="${BASH_REMATCH[1]}"
-      fi
-    fi
-  done <<< "$incoming"
-  [[ -n "$cur_id" ]] && inc_blocks["$cur_id"]="$cur_block"
+    mode == "base" && !in_block { preamble = preamble $0 "\n" }
 
-  declare -A all_ids
-  for id in "${!base_blocks[@]}"; do all_ids["$id"]=1; done
-  for id in "${!inc_blocks[@]}";  do all_ids["$id"]=1; done
-
-  local sorted_ids
-  mapfile -t sorted_ids < <(printf '%s\n' "${!all_ids[@]}" | sort -t- -k2 -n)
-
-  local result="$preamble"
-  for id in "${sorted_ids[@]}"; do
-    local have_base=false have_inc=false
-    [[ -n "${base_blocks[$id]+x}" ]] && have_base=true
-    [[ -n "${inc_blocks[$id]+x}" ]]  && have_inc=true
-
-    if $have_base && $have_inc; then
-      local bt="${base_ts[$id]:-}" it="${inc_ts[$id]:-}"
-      if [[ -n "$it" ]] && [[ "$it" > "$bt" ]]; then
-        result+=$'\n'"${inc_blocks[$id]}"
-      else
-        result+=$'\n'"${base_blocks[$id]}"
-      fi
-    elif $have_base; then
-      result+=$'\n'"${base_blocks[$id]}"
-    else
-      result+=$'\n'"${inc_blocks[$id]}"
-    fi
-  done
-
-  printf '%s' "$result"
+    END {
+      if (cur_id != "") {
+        if (mode == "base") base_block[cur_id] = cur_block
+        else                inc_block[cur_id]  = cur_block
+      }
+      printf "%s", preamble
+      for (id in base_block) all[id] = 1
+      for (id in inc_block)  all[id] = 1
+      n = 0
+      for (id in all) ids[n++] = id
+      for (i = 0; i < n-1; i++)
+        for (j = i+1; j < n; j++) {
+          split(ids[i], a, "-"); split(ids[j], b, "-")
+          if (a[2]+0 > b[2]+0) { t=ids[i]; ids[i]=ids[j]; ids[j]=t }
+        }
+      for (i = 0; i < n; i++) {
+        id = ids[i]
+        if (id in base_block && id in inc_block)
+          printf "\n%s", (inc_ts[id] > base_ts[id] ? inc_block[id] : base_block[id])
+        else if (id in base_block)
+          printf "\n%s", base_block[id]
+        else
+          printf "\n%s", inc_block[id]
+      }
+    }
+  '
 }
 
 # ─── COMMANDS ────────────────────────────────────────────
