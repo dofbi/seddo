@@ -956,9 +956,38 @@ cmd_sync() {
 # ── seddo inbox ──────────────────────────────────────────
 cmd_inbox() {
   require_seddo
-  echo "📥 Inbox — ${seddo_name}"
-  echo ""
-  fetch_file "INBOX.md"
+  local json_mode=false
+  if [[ "${1:-}" == "--json" ]]; then
+    json_mode=true
+    shift
+  fi
+  local content
+  content=$(fetch_from "$GIST_ID" "INBOX.md")
+  if $json_mode; then
+    local first=true
+    echo "{\"inbox\":["
+    echo "$content" | grep -v '^<!--' | grep -v '^Format:' | grep -v '^Status:' | grep -v '^-->' | grep -v '^$' | grep -v '^#' | grep -v '^---' | grep -v '^$' | tail -n +2 \
+    | while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local target msg sender ts
+      target=$(echo "$line" | sed -n 's/^→ \(@[^ :]*\).*/\1/p')
+      sender=$(echo "$line" | sed -n 's/.*— \(@[^ ]*\).*/\1/p')
+      ts=$(echo "$line" | sed -n 's/.* \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}:[0-9]\{2\}Z\).*/\1/p' | sed 's/✅//; s/⏳//')
+      msg=$(echo "$line" | sed -n 's/^→ @[^ :]* : \(.*\) — @[^ ]*.*/\1/p')
+      [[ -n "$msg" ]] || msg="$line"
+      local escaped_msg
+      escaped_msg=$(json_escape "$msg")
+      $first && first=false || echo ","
+      printf '  {"target":"%s","message":"%s","sender":"%s","ts":"%s"}' \
+        "$target" "$escaped_msg" "$sender" "$ts"
+    done
+    echo ""
+    echo "]}"
+  else
+    echo "📥 Inbox — ${seddo_name}"
+    echo ""
+    echo "$content"
+  fi
 }
 
 # ── seddo send ──────────────────────────────────────────
@@ -973,6 +1002,8 @@ cmd_send() {
 
   local current_inbox
   current_inbox=$(fetch_from "$GIST_ID" "INBOX.md")
+  local current_activity
+  current_activity=$(fetch_from "$GIST_ID" "ACTIVITY.md")
   local new_msg="→ ${target} : ${message} — @${AGENT_NAME} ${ts}"
   edit_files "$GIST_ID" "INBOX.md" "${current_inbox}"$'\n'"${new_msg}" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Message sent to ${target}"
 
@@ -985,9 +1016,51 @@ cmd_send() {
 # ── seddo tasks ─────────────────────────────────────────
 cmd_tasks() {
   require_seddo
-  echo "📋 Tasks — ${seddo_name}"
-  echo ""
-  fetch_file "TASKS.md"
+  local json_mode=false
+  if [[ "${1:-}" == "--json" ]]; then
+    json_mode=true
+    shift
+  fi
+  local content
+  content=$(fetch_from "$GIST_ID" "TASKS.md")
+  if $json_mode; then
+    echo "{\"tasks\":["
+    local first_entry=true
+    # Strip HTML comment blocks (template header) before parsing
+    echo "$content" | sed '/^<!--/,/^-->/d' | sed 's/✅//g' | sed 's/⏳//g' | awk '
+      /^### T-/ {
+        if (id != "") {
+          gsub(/"/, "\\\"", title)
+          if (!first_entry) print ","
+          first_entry = false
+          printf "  {\"id\":\"%s\",\"status\":\"%s\",\"assigned\":\"%s\",\"priority\":\"%s\",\"title\":\"%s\"}", id, status, assigned, priority, title
+        }
+        split($0, a, ": "); id = a[2]
+        gsub(/^[ \t]+/, "", id)
+        status = "OPEN"; assigned = "@any"; priority = "MEDIUM"; title = ""
+      }
+      /^\- status:/ { sub("- status: ", ""); status = $0 }
+      /^\- assigned:/ { sub("- assigned: ", ""); assigned = $0 }
+      /^\- priority:/ { sub("- priority: ", ""); priority = $0 }
+      /^$|^#|^---/ { next }
+      /^[ \t]*[^- ]/ && id != "" {
+        desc = substr($0, 4); title = (title == "" ? desc : title " " desc)
+      }
+      END {
+        if (id != "") {
+          gsub(/"/, "\\\"", title)
+          if (!first_entry) print ","
+          printf "  {\"id\":\"%s\",\"status\":\"%s\",\"assigned\":\"%s\",\"priority\":\"%s\",\"title\":\"%s\"}", id, status, assigned, priority, title
+        }
+      }
+    '
+    echo ""
+    echo "]}"
+  else
+    echo "📋 Tasks — ${seddo_name}"
+    echo ""
+    echo "$content"
+  fi
 }
 
 # ── seddo add ───────────────────────────────────────────
@@ -1113,6 +1186,39 @@ cmd_done() {
   edit_file "$GIST_ID" "ACTIVITY.md" "${current_activity}"$'\n'"${ts} @${AGENT_NAME} — Task ${task_id} DONE: ${output}"
 
   echo "✅ Task ${task_id} marked DONE"
+}
+
+# ── seddo ack ───────────────────────────────────────────
+# Mark a message in INBOX.md as read by prepending ✓.
+# Usage: seddo ack "partial message text"
+cmd_ack() {
+  local pattern="${1:-}"
+  require_seddo
+
+  if [[ -z "$pattern" ]]; then
+    echo "Usage: seddo ack \"partial message text\""
+    echo "   Marks the matching line in INBOX.md with ✓"
+    exit 1
+  fi
+
+  local current_inbox
+  current_inbox=$(fetch_from "$GIST_ID" "INBOX.md")
+
+  # Escape special chars for sed
+  local esc_pattern
+  esc_pattern=$(echo "$pattern" | sed 's/[^^a-zA-Z0-9_/. -]/\\&/g')
+
+  # Only match lines not already marked
+  local updated
+  updated=$(echo "$current_inbox" | sed "s/^\(→ [^✓].*${esc_pattern}.*\)/✓ \1/")
+
+  if [[ "$updated" == "$current_inbox" ]]; then
+    echo "❌ No unmarked line matching: $pattern"
+    exit 1
+  fi
+
+  edit_file "$GIST_ID" "INBOX.md" "$updated"
+  echo "✅ Marked read: $pattern"
 }
 
 # ── seddo lesson ────────────────────────────────────────
@@ -1302,13 +1408,14 @@ case "${1:-help}" in
   forks)         cmd_forks ;;
   who)           cmd_who ;;
   sync)          cmd_sync "${2:-}" ;;
-  inbox)         cmd_inbox ;;
+  inbox)         cmd_inbox "${2:-}" ;;
   send)          cmd_send "$2" "${@:3}" ;;
-  tasks)         cmd_tasks ;;
+  tasks)         cmd_tasks "${2:-}" ;;
   add)           cmd_add "${2:-}" "${3:-MEDIUM}" "${4:-@any}" ;;
   claim)         cmd_claim "${2:-}" ;;
   update)        cmd_update "${2:-}" "${3:-WIP}" ;;
   done)          cmd_done "${2:-}" "${@:3}" ;;
+  ack)           cmd_ack "${2:-}" ;;
   lesson)        cmd_lesson "${2:-}" "${3:-process}" ;;
   log)           cmd_log ;;
   info)          cmd_info ;;
