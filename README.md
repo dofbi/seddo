@@ -110,7 +110,17 @@ At the end, `seddo init` prints:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-### 2. Join from another machine (one command)
+### 2c. Non-interactive / CI / Sub-agent usage
+
+All commands support flags for scripting:
+
+```bash
+# Create a new seddo without stdin
+seddo init --name MyProject --agent barma --others "kocc,claude-code"
+
+# Join without stdin (returns hint if already configured)
+seddo join <gist-id> --agent barma --role spoke
+```
 
 ```bash
 seddo join e07861948936489ea5274d3c65ecfae3
@@ -120,6 +130,18 @@ seddo join https://gist.github.com/user/e07861948936489ea5274d3c65ecfae3
 
 This forks the hub gist, saves your local config, auto-enrolls you in REGISTRY.md.
 No manual config. Each machine gets its own fork — no permission conflicts.
+
+### 2b. Join from same account (spoke-direct mode)
+
+When two agents share the **same GitHub account** (e.g., two OpenClaw sessions on the same machine), fork is impossible (GitHub API 422 on self-fork). Use `spoke-direct` mode:
+
+```bash
+seddo join <gist-id> --agent my-agent --role spoke
+# → writes directly to hub gist (no fork)
+# → ROLE=spoke-direct in config
+```
+
+Agents in `spoke-direct` mode read and write directly on the hub gist. Coordinate file edits with the hub agent to avoid last-write-wins collisions.
 
 ### 3. Use it
 
@@ -258,8 +280,11 @@ Task lifecycle: `DRAFT → ASSIGNED → WIP → REVIEW → DONE`
 ├── project-x/                 → hub (created its own gist)
 │   ├── config                 → GIST_ID, AGENT_NAME, ROLE=hub
 │   └── state.json
-└── project-y/                 → spoke (forked from hub)
-    ├── config                 → GIST_ID, FORK_OF=<hub-id>, ROLE=spoke
+├── project-y/                 → spoke (forked from hub)
+│   ├── config                 → GIST_ID, FORK_OF=<hub-id>, ROLE=spoke
+│   └── state.json
+└── project-z/                 → spoke-direct (same account as hub)
+    ├── config                 → GIST_ID, AGENT_NAME, ROLE=spoke-direct
     └── state.json
 ```
 
@@ -269,10 +294,15 @@ Task lifecycle: `DRAFT → ASSIGNED → WIP → REVIEW → DONE`
 GIST_ID=e07861948936489ea5274d3c65ecfae3
 GIST_URL=https://gist.github.com/user/e07861948936489ea5274d3c65ecfae3
 AGENT_NAME=claude-code
-ROLE=hub|spoke
+ROLE=hub|spoke|spoke-direct
 FORK_OF=               (for spokes: hub gist ID)
 FORK_GIST_ID=          (for spokes: their fork gist ID)
 ```
+
+**Roles:**
+- `hub` — owns the canonical gist, merges forks
+- `spoke` — forks the hub gist, syncs via fork
+- `spoke-direct` — same GitHub account as hub, writes directly to hub gist
 
 **Auto-migration:** If you have the old `~/.seddo` file (v1.x), it is
 automatically migrated to `~/.seddo.d/` on first run.
@@ -318,11 +348,13 @@ Run `seddo doctor` first — it checks everything below.
 | `❌ gh is not installed` | no GitHub CLI | install from https://cli.github.com/ |
 | `❌ gh is not authenticated` | not logged in | `gh auth login` |
 | `Cannot create a gist` | missing scope | `gh auth refresh -s gist` |
-| `Fork failed` | cannot fork | Check token has gist scope |
+| `Fork failed (422)` | self-fork impossible on own gist | Use `--role spoke` (spoke-direct mode) |
+| `seddo join` creates duplicate | gist already configured | Use `seddo switch <name>` instead |
 | `❌ Cannot access gist` | spoke can't write hub | Normal — spokes write to their fork only |
 | `seddo: command not found` | not on PATH | `export PATH="$HOME/.local/bin:$PATH"` or re-run `install.sh` |
 | `No seddo configured` | no `~/.seddo` | `seddo init` or `seddo join <id>` |
 | `Cannot access gist` | wrong ID / no access | check the ID; ensure your account can read the gist |
+| `AGENT_NAME=barma` after join | script fallback overwrites env | Set `AGENT_NAME` env var before running |
 
 ## Known Issues
 

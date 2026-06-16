@@ -21,8 +21,9 @@ license: MIT
 **Hub-and-spoke model:**
 - **HUB**: creates the canonical gist. Owns the source of truth.
 - **SPOKE**: forks the hub gist. Gets write access via the fork.
+- **SPOKE-DIRECT**: same GitHub account as hub — fork is impossible (GitHub 422). Writes directly to hub gist.
 
-Each machine/agent works on its own fork. No permission conflicts.
+Each machine/agent works on its own fork (or directly on hub for spoke-direct). No permission conflicts.
 
 ## Role of Each Agent
 
@@ -30,6 +31,7 @@ Each machine/agent works on its own fork. No permission conflicts.
 |------|---------|--------|
 | **Hub** | Original gist | Read + Write on hub gist |
 | **Spoke** | Fork of hub | Read + Write on own fork; Read on hub |
+| **Spoke-direct** | None (same account) | Read + Write directly on hub gist |
 
 Sync is pull-based: spokes pull from hub when they want updates. Hub reads REGISTRY.md to know about forks.
 
@@ -148,8 +150,7 @@ ln -sf ~/.config/opencode/skills/seddo/seddo.sh ~/.local/bin/seddo
 ## Init Flow
 
 ```
-seddo init
-  → Ask: seddo name, agent name, other agents
+seddo init [--name <name>] [--agent <agent>] [--others "agent1,agent2"]
   → Create hub gist with all 7 files
   → Save ~/.seddo.d/<name>/config (ROLE=hub)
   → Generate join token
@@ -158,11 +159,18 @@ seddo init
 ## Join Flow
 
 ```
-seddo join <gist-id>
+seddo join <gist-id> [--agent <name>] [--role spoke|hub]
   → Fork the hub gist (gives write access)
   → Save ~/.seddo.d/<name>/config (ROLE=spoke, FORK_OF=<hub-id>)
   → Auto-register in hub's REGISTRY.md
   → Log arrival in hub's INBOX.md
+```
+
+**Spoke-direct** (same GitHub account, no self-fork):
+```bash
+seddo join <gist-id> --agent my-agent --role spoke
+# → writes directly to hub gist, no fork
+# → ROLE=spoke-direct in config
 ```
 
 ## Conflict Resolution
@@ -178,4 +186,4 @@ seddo join <gist-id>
 - Gist ID extraction: script handles 20–32 char hex IDs, URLs
 - Writes use `gh api PATCH` with bash JSON escaping (`gh gist edit` ignores piped stdin)
 - Forking requires `gist` OAuth scope — if `seddo join` fails, check `gh auth status`
-- If you own the hub gist, `seddo join` configures you as HUB (not a fork)
+- If you own the hub gist, `seddo join` configures you as HUB by default. Use `--role spoke` for spoke-direct mode (writes directly, no fork).
