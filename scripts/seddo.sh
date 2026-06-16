@@ -18,7 +18,7 @@ set -euo pipefail
 SEDDO_ROOT="${SEDDO_ROOT:-$HOME/.seddo.d}"
 SEDDO_ACTIVE_FILE="${SEDDO_ROOT}/active"
 # Version: auto-detected from git tag or SHA if available
-SEDDO_VERSION="2.6.5"
+SEDDO_VERSION="2.6.6"
 
 # Read version from .version file (publish-time, travels with skill)
 # Fallback to git describe, then hardcoded SEDDO_VERSION
@@ -53,7 +53,7 @@ seddo_state=""
 # Active seddo config (from files)
 GIST_ID=""
 AGENT_NAME=""
-ROLE=""           # hub | spoke
+ROLE=""           # hub | spoke | spoke-direct
 FORK_OF=""        # gist ID of hub (for spokes)
 FORK_GIST_ID=""   # our fork's gist ID (for spokes)
 GH_USER=""
@@ -378,6 +378,18 @@ merge_tasks() {
 
 # ── seddo init ──────────────────────────────────────────
 cmd_init() {
+  # Parse flags: --name, --agent, --others
+  local flag_name="" flag_agent="" flag_others=""
+  local args=()
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --name)   flag_name="$2";   shift 2 ;;
+      --agent)  flag_agent="$2";  shift 2 ;;
+      --others) flag_others="$2"; shift 2 ;;
+      *)        args+=("$1");     shift ;;
+    esac
+  done
+
   echo "🤝 Seddo — Create a new coordination space"
   echo "   (wolof: séddo = partager)"
   echo ""
@@ -389,27 +401,35 @@ cmd_init() {
   echo ""
 
   echo "🔍 Testing GitHub permissions..."
-  local test_tmp
+  local test_tmp test_id
   test_tmp=$(mktemp)
+  # Cleanup test gist even if script dies mid-run
+  trap '[[ -n "${test_id:-}" ]] && gh gist delete "$test_id" --yes &>/dev/null || true' EXIT
   echo "seddo-test" > "$test_tmp"
   local test_url
-  test_url=$(gh gist create -d "seddo-test" -f "test.md" < "$test_tmp" 2>&1 | head -1)
+  test_url=$(gh gist create -d "seddo-test" -f "test.md" < "$test_tmp" 2>/dev/null | tail -1)
   rm -f "$test_tmp"
 
   if [[ -z "$test_url" ]]; then
     echo "❌ Cannot create gists. Check gist scope: gh auth status"
     exit 1
   fi
-  local test_id
   test_id=$(extract_gist_id "$test_url")
   gh gist delete "$test_id" --yes &>/dev/null || true
+  test_id=""
+  trap - EXIT
   echo "✅ Secret gist creatable"
   echo ""
 
-  echo "📂 Seddo name? (no spaces, used as folder name)"
-  read -rp "   → " name_input
-  name_input="${name_input:-seddo}"
-  name_input=$(echo "$name_input" | tr -cd 'a-zA-Z0-9_-')
+  local name_input
+  if [[ -n "$flag_name" ]]; then
+    name_input=$(echo "$flag_name" | tr -cd 'a-zA-Z0-9_-')
+  else
+    echo "📂 Seddo name? (no spaces, used as folder name)"
+    read -rp "   → " name_input
+    name_input="${name_input:-seddo}"
+    name_input=$(echo "$name_input" | tr -cd 'a-zA-Z0-9_-')
+  fi
   if [[ -z "$name_input" ]]; then
     echo "❌ Invalid name."
     exit 1
@@ -417,29 +437,33 @@ cmd_init() {
 
   if [[ -d "${SEDDO_ROOT}/${name_input}" ]]; then
     echo "⚠️  Seddo « ${name_input} » already exists locally."
-    read -rp "   Overwrite? [y/N] → " confirm
-    [[ "$confirm" != "y" ]] && exit 0
+    if [[ -z "$flag_name" ]]; then
+      read -rp "   Overwrite? [y/N] → " confirm
+      [[ "$confirm" != "y" ]] && exit 0
+    else
+      echo "   Use --name with a different name or remove it first."
+      exit 1
+    fi
   fi
 
   echo ""
-  echo "👤 Agent name? (your identity in this seddo)"
-  local detected=""
-  if [[ -n "$AGENT_NAME" ]]; then
-    detected="$AGENT_NAME"
-  elif [[ -d "$HOME/.claude" ]]; then
-    detected="claude-code"
-  elif command -v openclaw &>/dev/null; then
-    detected="kocc"
-  elif [[ -d "$HOME/.opencode" ]]; then
-    detected="opencode"
+  local agent_name
+  if [[ -n "$flag_agent" ]]; then
+    agent_name="$flag_agent"
+  else
+    echo "👤 Agent name? (your identity in this seddo)"
+    local detected="${AGENT_NAME:-${SEDDO_AGENT:-}}"
+    echo "   (Enter for: ${detected:-agent})"
+    read -rp "   → " agent_input
+    agent_name="${agent_input:-${detected:-agent}}"
   fi
-  echo "   (Enter for: ${detected:-agent})"
-  read -rp "   → " agent_input
-  local agent_name="${agent_input:-${detected:-agent}}"
 
-  echo ""
-  echo "📋 Other agents in this seddo? (comma-separated, optional)"
-  read -rp "   → " other_agents
+  local other_agents="${flag_others:-}"
+  if [[ -z "$flag_others" && -z "$flag_name" ]]; then
+    echo ""
+    echo "📋 Other agents in this seddo? (comma-separated, optional)"
+    read -rp "   → " other_agents
+  fi
 
   echo ""
   echo "🤖 Creating hub gist..."
@@ -539,7 +563,7 @@ EOF
     "$tmpdir/LESSONS.md" \
     "$tmpdir/ACTIVITY.md" \
     "$tmpdir/REGISTRY.md" \
-    2>&1 | head -1)
+    2>/dev/null | tail -1)
   rm -rf "$tmpdir"
 
   local gist_id
@@ -600,11 +624,20 @@ EOF
 
 # ── seddo join ──────────────────────────────────────────
 cmd_join() {
-  local input="${1:-}"
+  # Parse flags: --agent, --role
+  local flag_agent="" flag_role="" input=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --agent) flag_agent="$2"; shift 2 ;;
+      --role)  flag_role="$2";  shift 2 ;;
+      *)       input="$1";      shift ;;
+    esac
+  done
+
   require_gh
 
   if [[ -z "$input" ]]; then
-    echo "Usage: seddo join <gist-id-or-url>"
+    echo "Usage: seddo join <gist-id-or-url> [--agent <name>] [--role spoke|hub]"
     exit 1
   fi
 
@@ -623,28 +656,47 @@ cmd_join() {
     exit 1
   }
 
+  # Extract name from PROTOCOL.md first line: "# <name> — Seddo Protocol"
   local swarm_name
-  swarm_name=$(echo "$raw" | grep -m1 '^# Roster\|^# Protocol\|^# Tasks\|^# .*—' \
-    | head -1 | sed 's/^# //' | sed 's/ —.*//' | xargs)
+  swarm_name=$(gh gist view "$hub_gist_id" -f PROTOCOL.md 2>/dev/null \
+    | head -1 | sed 's/^# //' | sed 's/ —.*//' | xargs 2>/dev/null || true)
+  [[ -z "$swarm_name" ]] && swarm_name=$(echo "$raw" \
+    | grep -m1 '^# Roster\|^# Protocol\|^# Tasks\|^# .*—' \
+    | sed 's/^# //' | sed 's/ —.*//' | xargs 2>/dev/null || true)
   [[ -z "$swarm_name" ]] && swarm_name="seddo"
 
-  local detected=""
-  if [[ -n "$AGENT_NAME" ]]; then
-    detected="$AGENT_NAME"
-  elif [[ -d "$HOME/.claude" ]]; then
-    detected="claude-code"
-  elif command -v openclaw &>/dev/null; then
-    detected="kocc"
-  elif [[ -d "$HOME/.opencode" ]]; then
-    detected="opencode"
+  ensure_seddo_root
+
+  # Detect if this gist is already configured locally (prevent duplicates)
+  local existing_seddo=""
+  for dir in "${SEDDO_ROOT}"/*/; do
+    [[ -f "${dir}config" ]] || continue
+    local cfg_gist
+    cfg_gist=$(grep '^GIST_ID=' "${dir}config" 2>/dev/null | cut -d= -f2-)
+    if [[ "$cfg_gist" == "$hub_gist_id" ]]; then
+      existing_seddo=$(basename "$dir")
+      break
+    fi
+  done
+
+  if [[ -n "$existing_seddo" ]]; then
+    echo "⚠️  Gist already configured locally as « ${existing_seddo} »"
+    echo "   Use: seddo switch ${existing_seddo}"
+    exit 0
   fi
 
-  echo "✅ Hub gist accessible: ${swarm_name}"
-  echo ""
-  echo "👤 Your agent name?"
-  echo "   (Enter for: ${detected:-agent})"
-  read -rp "   → " agent_input
-  local agent_name="${agent_input:-${detected:-agent}}"
+  local agent_name
+  if [[ -n "$flag_agent" ]]; then
+    agent_name="$flag_agent"
+  else
+    echo "✅ Hub gist accessible: ${swarm_name}"
+    echo ""
+    echo "👤 Your agent name?"
+    local detected="${AGENT_NAME:-${SEDDO_AGENT:-}}"
+    echo "   (Enter for: ${detected:-agent})"
+    read -rp "   → " agent_input
+    agent_name="${agent_input:-${detected:-agent}}"
+  fi
 
   echo ""
   echo "🔱 Forking hub gist (this gives you write access)..."
@@ -655,11 +707,10 @@ cmd_join() {
   fork_url=$(echo "$fork_json" | grep -oP '"html_url":\s*"\Khttps://gist.github.com[^"]+' | head -1 || true)
   fork_error=$(echo "$fork_json" | grep -oP '"message":\s*"\K[^"]+' | head -1 || true)
 
-  # If user owns the hub gist, configure as hub mode instead
+  # Self-fork impossible: user owns the hub gist
   if [[ "$fork_error" == *"cannot fork your own gist"* ]]; then
-    echo "⚠️  You own this gist — configuring as HUB mode (no fork needed)"
-
-    ensure_seddo_root
+    local canonical_url="https://gist.github.com/${hub_gist_id}"
+    [[ -n "$GH_USER" ]] && canonical_url="https://gist.github.com/${GH_USER}/${hub_gist_id}"
 
     local local_name="${swarm_name}"
     local counter=1
@@ -668,8 +719,44 @@ cmd_join() {
       ((counter++))
     done
 
-    local canonical_url="https://gist.github.com/${hub_gist_id}"
-    [[ -n "$GH_USER" ]] && canonical_url="https://gist.github.com/${GH_USER}/${hub_gist_id}"
+    if [[ "$flag_role" == "spoke" ]]; then
+      # spoke-direct: write directly to hub gist, no fork
+      echo "⚠️  Self-fork impossible — configuring as SPOKE-DIRECT (writes to hub gist)"
+
+      save_seddo_config "$local_name" <<EOF
+GIST_ID=${hub_gist_id}
+GIST_URL=${canonical_url}
+AGENT_NAME=${agent_name}
+ROLE=spoke-direct
+FORK_OF=
+FORK_GIST_ID=
+EOF
+
+      save_state_json "$local_name" <<EOF
+{
+  "role": "spoke-direct",
+  "gist_id": "${hub_gist_id}",
+  "gist_url": "${canonical_url}",
+  "mode": "direct-write",
+  "joined_at": "$(now)",
+  "agent_name": "${agent_name}"
+}
+EOF
+
+      echo ""
+      echo "✅ Joined seddo « ${local_name} » as @${agent_name}"
+      echo "   Role    : SPOKE-DIRECT (writes directly to hub, no fork isolation)"
+      echo "   Gist    : ${hub_gist_id}"
+      echo "   ⚠️  Coordinate writes with hub agent to avoid collisions."
+      echo ""
+      echo "Next steps:"
+      echo "  seddo sync      — read all files"
+      echo "  seddo inbox     — check messages"
+      return 0
+    fi
+
+    # Default: configure as hub (own-gist mode)
+    echo "⚠️  You own this gist — configuring as HUB mode (no fork needed)"
 
     save_seddo_config "$local_name" <<EOF
 GIST_ID=${hub_gist_id}
@@ -695,6 +782,7 @@ EOF
     echo "✅ Joined seddo « ${local_name} » as @${agent_name}"
     echo "   Role    : HUB (you own this gist)"
     echo "   Gist    : ${hub_gist_id}"
+    echo "   Tip     : use --role spoke to join as spoke-direct instead"
     echo ""
     echo "Next steps:"
     echo "  seddo sync      — read all files"
@@ -836,6 +924,7 @@ cmd_switch() {
 
   local role_display="HUB"
   [[ "$ROLE" == "spoke" ]] && role_display="SPOKE"
+  [[ "$ROLE" == "spoke-direct" ]] && role_display="SPOKE-DIRECT"
   echo "✅ Switched to « ${name} » (${role_display})"
   echo "   Gist ID : ${GIST_ID:0:8}..."
   echo "   Agent   : @${AGENT_NAME}"
@@ -879,6 +968,7 @@ cmd_status() {
 
   local role_display="HUB"
   [[ "$ROLE" == "spoke" ]] && role_display="SPOKE (fork)"
+  [[ "$ROLE" == "spoke-direct" ]] && role_display="SPOKE-DIRECT (no fork)"
 
   echo "🤝 Seddo: ${seddo_name}"
   echo "   Role    : ${role_display}"
@@ -892,6 +982,11 @@ cmd_status() {
     echo ""
     echo "   Sync: seddo sync"
     echo "     → pulls hub + merges into your fork (bi-directional)"
+  elif [[ "$ROLE" == "spoke-direct" ]]; then
+    echo "   Hub gist : ${GIST_ID} (writes directly, no fork)"
+    echo ""
+    echo "   Sync: seddo sync"
+    echo "     → reads hub gist directly (no merge needed)"
   else
     echo "   Hub gist : ${GIST_ID} (you own it)"
     local fork_count
@@ -971,6 +1066,17 @@ cmd_sync() {
       "TASKS.md"    "$hub_tasks"
 
     echo "✅ Hub synced: merged ${merged_count} fork(s) → hub gist (${GIST_ID:0:8}...)"
+
+  elif [[ "$ROLE" == "spoke-direct" ]]; then
+    # No fork — reads directly from hub gist, no merge needed
+    echo "🔄 [SPOKE-DIRECT] Reading hub gist ${GIST_ID:0:8}..."
+    local sd_inbox
+    sd_inbox=$(fetch_file "INBOX.md" 2>/dev/null || true)
+    local inbox_count task_count
+    inbox_count=$(echo "$sd_inbox" | grep -c '^→' || true)
+    task_count=$(fetch_file "TASKS.md" 2>/dev/null | grep -c '^### T-' || true)
+    echo "   Messages: ${inbox_count} | Tasks: ${task_count}"
+    echo "✅ Spoke-direct synced (read-only pull from hub)"
 
   else
     # SPOKE: pull hub → merge with own fork → write to fork
@@ -1556,8 +1662,8 @@ cmd_who() {
 load_active_seddo 2>/dev/null || true
 
 case "${1:-help}" in
-  init)          cmd_init "${2:-}" ;;
-  join)          cmd_join "${2:-}" ;;
+  init)          cmd_init "${@:2}" ;;
+  join)          cmd_join "${@:2}" ;;
   list)          cmd_list ;;
   switch)        cmd_switch "${2:-}" ;;
   remove)        cmd_remove "${2:-}" ;;
@@ -1585,8 +1691,11 @@ case "${1:-help}" in
     echo "Usage: seddo <command> [args]"
     echo ""
     echo "Setup:"
-    echo "  init                  Create a new hub seddo (creates a gist)"
-    echo "  join <gist-id>        Fork and join an existing seddo"
+    echo "  init [--name N] [--agent A] [--others O]"
+    echo "                        Create a new hub seddo (non-interactive with flags)"
+    echo "  join <gist-id> [--agent A] [--role spoke|hub]"
+    echo "                        Fork and join an existing seddo"
+    echo "                        --role spoke: spoke-direct mode (same-account, no fork)"
     echo "  list                  Show all seddos on this machine (~/.seddo.d/)"
     echo "  switch <name>         Switch to another seddo"
     echo "  remove <name>         Remove a seddo workspace (local only)"
