@@ -18,7 +18,7 @@ set -euo pipefail
 SEDDO_ROOT="${SEDDO_ROOT:-$HOME/.seddo.d}"
 SEDDO_ACTIVE_FILE="${SEDDO_ROOT}/active"
 # Version: auto-detected from git tag or SHA if available
-SEDDO_VERSION="2.6.5"
+SEDDO_VERSION="2.6.6"
 
 # Read version from .version file (publish-time, travels with skill)
 # Fallback to git describe, then hardcoded SEDDO_VERSION
