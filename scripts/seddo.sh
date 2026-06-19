@@ -36,13 +36,41 @@ _seddo_version() {
   fi
 }
 
-_seddo_hash() {
+# Detect a usable SHA-256 tool: GNU `sha256sum` (Linux) or `shasum -a 256` (macOS/BSD).
+_seddo_sha256() {
   if command -v sha256sum &>/dev/null; then
-    local dir; dir="$(cd "$(dirname "$0")/.." && pwd)"
-    cat "${dir}/SKILL.md" "$0" "${dir}/AGENTS.md" 2>/dev/null | sha256sum | cut -c1-12 || echo "unknown"
+    sha256sum
+  elif command -v shasum &>/dev/null; then
+    shasum -a 256
   else
-    echo "unknown"
+    return 1
   fi
+}
+
+_seddo_hash() {
+  _seddo_sha256 </dev/null &>/dev/null || { echo "unknown"; return; }
+  # Resolve through symlinks (e.g. ~/.local/bin/seddo) so SKILL.md/AGENTS.md are found
+  # next to the real script. macOS has no `readlink -f`, so walk the links manually.
+  local src="$0" d
+  while [[ -h "$src" ]]; do
+    d="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$d/$src"
+  done
+  local dir; dir="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)"
+  # Hash whichever skill files exist. Layout differs: repo has SKILL.md/AGENTS.md at
+  # root with the script in scripts/; a flat skill install has them all side by side.
+  local files=()
+  local f
+  for f in "${dir}/SKILL.md" "${dir}/AGENTS.md" "${dir}/../SKILL.md" "${dir}/../AGENTS.md" "$src"; do
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  [[ ${#files[@]} -eq 0 ]] && { echo "unknown"; return; }
+  # Capture into a var: `cat` may exit nonzero under `set -o pipefail`, but the hash is
+  # still computed — never let a trailing "|| echo unknown" tack a 2nd line onto stdout.
+  local h
+  h=$(cat "${files[@]}" 2>/dev/null | _seddo_sha256 | cut -c1-12) || true
+  echo "${h:-unknown}"
 }
 
 # Per-seddo paths (set by load_config)
@@ -112,6 +140,7 @@ load_seddo_config() {
   fi
   GIST_ID="${GIST_ID:-${SWARM_GIST_ID:-}}"
   AGENT_NAME="${AGENT_NAME:-${SEDDO_AGENT:-}}"
+  GIST_URL=$(grep '^GIST_URL=' "$seddo_config" 2>/dev/null | cut -d= -f2- || echo "")
   ROLE=$(grep '^ROLE=' "$seddo_config" 2>/dev/null | cut -d= -f2- || echo "hub")
   FORK_OF=$(grep '^FORK_OF=' "$seddo_config" 2>/dev/null | cut -d= -f2- || echo "")
   FORK_GIST_ID=$(grep '^FORK_GIST_ID=' "$seddo_config" 2>/dev/null | cut -d= -f2- || echo "")
@@ -167,9 +196,9 @@ require_role() {
 extract_gist_id() {
   local url="$1"
   local id
-  id=$(echo "$url" | grep -oP '[a-f0-9]{32}' | head -1)
+  id=$(echo "$url" | grep -oE '[a-f0-9]{32}' | head -1)
   [[ -n "$id" ]] && echo "$id" && return
-  id=$(echo "$url" | grep -oP '[a-f0-9]{20,}' | head -1)
+  id=$(echo "$url" | grep -oE '[a-f0-9]{20,}' | head -1)
   [[ -n "$id" ]] && echo "$id" && return
   return 1
 }
@@ -703,9 +732,9 @@ cmd_join() {
   local fork_json fork_id fork_url fork_error
   fork_json=$(fork_gist "$hub_gist_id")
 
-  fork_id=$(echo "$fork_json" | grep -oP '"id":\s*"\K[a-f0-9]{32}' | head -1 || true)
-  fork_url=$(echo "$fork_json" | grep -oP '"html_url":\s*"\Khttps://gist.github.com[^"]+' | head -1 || true)
-  fork_error=$(echo "$fork_json" | grep -oP '"message":\s*"\K[^"]+' | head -1 || true)
+  fork_id=$(echo "$fork_json" | jq -r '.id // empty' 2>/dev/null | head -1 || true)
+  fork_url=$(echo "$fork_json" | jq -r '.html_url // empty' 2>/dev/null | head -1 || true)
+  fork_error=$(echo "$fork_json" | jq -r '.message // empty' 2>/dev/null | head -1 || true)
 
   # Self-fork impossible: user owns the hub gist
   if [[ "$fork_error" == *"cannot fork your own gist"* ]]; then
@@ -1023,7 +1052,7 @@ cmd_sync() {
     local fork_ids=()
     while IFS= read -r fid; do
       [[ -n "$fid" ]] && fork_ids+=("$fid")
-    done < <(echo "$forks_json" | grep -oP '"id":\s*"\K[a-f0-9]{32}' || true)
+    done < <(echo "$forks_json" | jq -r '.[].id // empty' 2>/dev/null | grep -oE '^[a-f0-9]{32}$' || true)
 
     if [[ "${#fork_ids[@]}" -eq 0 ]]; then
       echo "   No forks found yet."
@@ -1122,10 +1151,16 @@ cmd_sync() {
     local roster
     roster=$(fetch_from "$GIST_ID" "ROSTER.md" 2>/dev/null || true)
     local new_row="- ${AGENT_NAME} | ${GIST_URL} | ${ts} | fork | v${my_ver} | sha:${my_hash}"
-    # Remove old row for this agent, append new
+    # Remove old row for this agent (both table "| name |" and drift "- name |" formats),
+    # drop any stray "unknown" line, and strip trailing blank lines (portable awk, not
+    # GNU-only sed) so the appended row always lands on its own line.
     local cleaned
-    cleaned=$(echo "$roster" | grep -v "| ${AGENT_NAME} |" || true)
-    edit_file "$GIST_ID" "ROSTER.md" "${cleaned}${new_row}"
+    cleaned=$(echo "$roster" \
+      | grep -v "| ${AGENT_NAME} |" \
+      | grep -v "^- ${AGENT_NAME} |" \
+      | grep -v '^unknown$' \
+      | awk 'NF{p=NR} {a[NR]=$0} END{for(i=1;i<=p;i++) print a[i]}' || true)
+    edit_file "$GIST_ID" "ROSTER.md" "${cleaned}"$'\n'"${new_row}"
 
     echo "✅ Spoke synced: fork (${GIST_ID:0:8}...) updated from hub"
   fi
@@ -1143,8 +1178,8 @@ _drift_check() {
   my_hash=$(_seddo_hash)
   if [[ "$ROLE" == "spoke" ]] && [[ -n "$FORK_OF" ]]; then
     local hub_roster; hub_roster=$(fetch_from "$FORK_OF" "ROSTER.md" 2>/dev/null || true)
-    baseline=$(echo "$hub_roster" | grep "| ${AGENT_NAME} |" | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' || true)
-    [[ -z "$baseline" ]] && baseline=$(echo "$hub_roster" | grep -v '^#' | grep '| hub |' | grep -oP 'sha:[a-f0-9]{12}' | sed 's/sha://' | head -1 || true)
+    baseline=$(echo "$hub_roster" | grep "| ${AGENT_NAME} |" | grep -oE 'sha:[a-f0-9]{12}' | sed 's/sha://' || true)
+    [[ -z "$baseline" ]] && baseline=$(echo "$hub_roster" | grep -v '^#' | grep '| hub |' | grep -oE 'sha:[a-f0-9]{12}' | sed 's/sha://' | head -1 || true)
     [[ -z "$baseline" ]] && baseline="$my_hash"
   else
     baseline="$my_hash"
@@ -1624,7 +1659,7 @@ cmd_forks() {
   echo "   $(echo "$forks_json" | grep -c '"id"') fork(s) found:"
   echo ""
 
-  echo "$forks_json" | grep -oP '"login":\s*"\K[^"]+' | while read -r owner; do
+  echo "$forks_json" | jq -r '.[].owner.login // empty' 2>/dev/null | while read -r owner; do
     echo "   - @${owner}"
   done
 
