@@ -73,6 +73,16 @@ _seddo_hash() {
   echo "${h:-unknown}"
 }
 
+# Portable JSON string field extractor: uses GNU grep -oP on Linux, falls back to jq on macOS/BSD.
+_json_str() {
+  local field="$1" json="$2"
+  if echo "" | grep -qP '' 2>/dev/null; then
+    echo "$json" | grep -oP "\"${field}\":\\s*\"\\K[^\"]+" | head -1
+  else
+    echo "$json" | jq -r ".${field} // empty" 2>/dev/null | head -1
+  fi
+}
+
 # Per-seddo paths (set by load_config)
 seddo_name=""
 seddo_config=""
@@ -732,9 +742,9 @@ cmd_join() {
   local fork_json fork_id fork_url fork_error
   fork_json=$(fork_gist "$hub_gist_id")
 
-  fork_id=$(echo "$fork_json" | jq -r '.id // empty' 2>/dev/null | head -1 || true)
-  fork_url=$(echo "$fork_json" | jq -r '.html_url // empty' 2>/dev/null | head -1 || true)
-  fork_error=$(echo "$fork_json" | jq -r '.message // empty' 2>/dev/null | head -1 || true)
+  fork_id=$(_json_str "id" "$fork_json" || true)
+  fork_url=$(_json_str "html_url" "$fork_json" || true)
+  fork_error=$(_json_str "message" "$fork_json" || true)
 
   # Self-fork impossible: user owns the hub gist
   if [[ "$fork_error" == *"cannot fork your own gist"* ]]; then
@@ -1052,7 +1062,7 @@ cmd_sync() {
     local fork_ids=()
     while IFS= read -r fid; do
       [[ -n "$fid" ]] && fork_ids+=("$fid")
-    done < <(echo "$forks_json" | jq -r '.[].id // empty' 2>/dev/null | grep -oE '^[a-f0-9]{32}$' || true)
+    done < <(echo "$forks_json" | grep -oE '"id":\s*"[a-f0-9]{20,}"' | grep -oE '[a-f0-9]{20,}' || true)
 
     if [[ "${#fork_ids[@]}" -eq 0 ]]; then
       echo "   No forks found yet."
@@ -1659,7 +1669,7 @@ cmd_forks() {
   echo "   $(echo "$forks_json" | grep -c '"id"') fork(s) found:"
   echo ""
 
-  echo "$forks_json" | jq -r '.[].owner.login // empty' 2>/dev/null | while read -r owner; do
+  echo "$forks_json" | grep -oE '"login":\s*"[^"]+"' | grep -oE '"[^"]+"$' | tr -d '"' | while read -r owner; do
     echo "   - @${owner}"
   done
 
